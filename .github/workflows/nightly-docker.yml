@@ -1,0 +1,230 @@
+name: Nightly Release (Docker)
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # midnight GMT
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare-nightly-release:
+    name: Prepare nightly tag + delete prior release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set nightly tag to latest main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git tag -f nightly origin/main
+          git push -f origin nightly
+
+      - name: Delete existing nightly release (if any)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete nightly --yes || true
+
+  build-wasm:
+    name: Build plugin.wasm
+    needs: prepare-nightly-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: nightly
+          fetch-depth: 0
+          submodules: true
+
+      - name: Install Rust 1.93 toolchain + wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+          components: rustc rust-std cargo clippy rustfmt
+          targets: wasm32-wasip1
+
+      - name: Show active toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -Vv
+          cargo -V
+          rustup target list --installed
+
+      - name: Install cargo-auditable
+        shell: bash
+        run: cargo install cargo-auditable
+
+      - name: Build wasm (auditable)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch
+          cargo auditable build --release --target wasm32-wasip1
+          cp target/wasm32-wasip1/release/plugin.wasm ./plugin.wasm
+
+      - name: Ensure plugin.wasm exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh ./plugin.wasm
+
+      - name: Record commit sha
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-wasm
+          path: plugin.wasm
+          if-no-files-found: error
+
+  package-and-push:
+    name: Package + push multi-arch image + sign
+    needs: build-wasm
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless signing
+    outputs:
+      nightly_digest: ${{ steps.digest.outputs.nightly_digest }}
+      nightly_ref: ${{ steps.meta.outputs.nightly_ref }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: nightly
+          fetch-depth: 0
+
+      - name: Download wasm artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-wasm
+          path: .
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image ref
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository }}"
+          echo "nightly_ref=${IMAGE}:nightly" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image (just copies plugin.wasm)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          tags: |
+            ${{ steps.meta.outputs.nightly_ref }}
+
+      - name: Resolve nightly digest
+        id: digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository }}"
+          REF="${IMAGE}:nightly"
+
+          nightly_digest="$(
+            docker buildx imagetools inspect "$REF" --format '{{json .Manifest}}' \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])'
+          )"
+
+          if [[ ! "$nightly_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "ERROR: Invalid digest: '$nightly_digest'" >&2
+            exit 1
+          fi
+
+          echo "nightly_digest=$nightly_digest" >> "$GITHUB_OUTPUT"
+          echo "Resolved nightly digest: $nightly_digest"
+
+      - name: Sign nightly manifest by digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository }}"
+          cosign sign --yes "${IMAGE}@${{ steps.digest.outputs.nightly_digest }}"
+
+  publish-nightly-release:
+    name: Publish nightly GitHub Release
+    needs: package-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository }}"
+          DIGEST="${{ needs.package-and-push.outputs.nightly_digest }}"
+          cat > release-body.md <<EOF
+          Nightly build from \`main\`.
+
+          Container image (tag):
+          - \`${IMAGE}:nightly\`
+
+          ✅ Immutable digest (recommended for pinning):
+          - \`${IMAGE}@${DIGEST}\`
+
+          All container images are signed with Cosign. Verify the **immutable digest** with:
+
+          \`\`\`bash
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/workflows/nightly.yml@refs/heads/main" \
+            --certificate-oidc-issuer-regexp "https://token.actions.githubusercontent.com" \
+            ${IMAGE}@${DIGEST}
+          \`\`\`
+          EOF
+
+      - name: Download plugin.wasm artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-wasm
+          path: .
+
+      - name: Create new nightly release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+        with:
+          tag_name: nightly
+          name: Nightly build
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+          preserve_order: true
+          body_path: release-body.md
+          files: |
+            plugin.wasm

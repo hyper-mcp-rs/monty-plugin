@@ -1,0 +1,21 @@
+[package]
+name = "plugin"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "plugin"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+base64-serde = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+extism-pdk = "1.4"
+schemars = "1.2"
+oauth2 = { version = "5.0", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[workspace]

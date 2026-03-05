@@ -1,0 +1,236 @@
+name: Release (ORAS)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-wasm:
+    name: Build plugin.wasm
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Record tag + commit sha
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust 1.93 toolchain + wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+          components: rustc rust-std cargo clippy rustfmt
+          targets: wasm32-wasip1
+
+      - name: Show active toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -Vv
+          cargo -V
+          rustup target list --installed
+
+      - name: Install cargo-auditable
+        shell: bash
+        run: cargo install cargo-auditable
+
+      - name: Build wasm (auditable)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch
+          cargo auditable build --release --target wasm32-wasip1
+          cp target/wasm32-wasip1/release/plugin.wasm ./plugin.wasm
+
+      - name: Ensure plugin.wasm exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh ./plugin.wasm
+
+      - name: Upload wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-wasm
+          path: plugin.wasm
+          if-no-files-found: error
+
+  publish-oras:
+    name: Publish ORAS artifact + sign
+    needs: build-wasm
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless signing
+    outputs:
+      tag_ref: ${{ steps.meta.outputs.tag_ref }}
+      latest_ref: ${{ steps.meta.outputs.latest_ref }}
+      tag_digest: ${{ steps.digest.outputs.tag_digest }}
+      latest_digest: ${{ steps.digest.outputs.latest_digest }}
+    steps:
+      - name: Download wasm artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-wasm
+          path: .
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
+      - name: ORAS login to GHCR
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Compute ORAS refs
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository }}"
+          TAG="${{ needs.build-wasm.outputs.tag }}"
+          echo "tag_ref=${IMAGE}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "latest_ref=${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Push ORAS artifact (plugin.wasm) for tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="${{ steps.meta.outputs.tag_ref }}"
+          oras push "$REF" \
+            --artifact-type application/vnd.hyper-mcp.plugin.v2 \
+            ./plugin.wasm:application/wasm
+
+      - name: Push ORAS artifact (plugin.wasm) for latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="${{ steps.meta.outputs.latest_ref }}"
+          oras push "$REF" \
+            --artifact-type application/vnd.hyper-mcp.plugin.v2 \
+            ./plugin.wasm:application/wasm
+
+      - name: Resolve ORAS digests
+        id: digest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag_ref="${{ steps.meta.outputs.tag_ref }}"
+          latest_ref="${{ steps.meta.outputs.latest_ref }}"
+
+          tag_digest="$(
+            oras manifest fetch "$tag_ref" --descriptor \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])'
+          )"
+          latest_digest="$(
+            oras manifest fetch "$latest_ref" --descriptor \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])'
+          )"
+
+          if [[ ! "$tag_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "ERROR: Invalid tag digest: '$tag_digest'" >&2
+            exit 1
+          fi
+          if [[ ! "$latest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "ERROR: Invalid latest digest: '$latest_digest'" >&2
+            exit 1
+          fi
+
+          echo "tag_digest=$tag_digest" >> "$GITHUB_OUTPUT"
+          echo "latest_digest=$latest_digest" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved tag digest:    $tag_digest"
+          echo "Resolved latest digest: $latest_digest"
+
+      - name: Sign ORAS artifacts by digest (tag + latest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository }}"
+          cosign sign --yes "${IMAGE}@${{ steps.digest.outputs.tag_digest }}"
+          cosign sign --yes "${IMAGE}@${{ steps.digest.outputs.latest_digest }}"
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: publish-oras
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download plugin.wasm artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-wasm
+          path: .
+
+      - name: Create release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          IMAGE="ghcr.io/${{ github.repository }}"
+          TAG_REF="${{ needs.publish-oras.outputs.tag_ref }}"
+          TAG_DIGEST="${{ needs.publish-oras.outputs.tag_digest }}"
+
+          cat > release-body.md <<EOF
+          Release for \`${TAG}\`.
+
+          OCI artifact (tag):
+          - \`${TAG_REF}\`
+
+          ✅ Immutable digest (recommended for pinning):
+          - \`${IMAGE}@${TAG_DIGEST}\`
+
+          Release asset:
+          - \`plugin.wasm\`
+
+          Pull with ORAS:
+          \`\`\`bash
+          oras pull ${TAG_REF}
+          \`\`\`
+
+          All artifacts are signed with Cosign. Verify the **immutable digest** with:
+
+          \`\`\`bash
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${TAG}" \
+            --certificate-oidc-issuer-regexp "https://token.actions.githubusercontent.com" \
+            ${IMAGE}@${TAG_DIGEST}
+          \`\`\`
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }} (ORAS)
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          preserve_order: true
+          body_path: release-body.md
+          files: |
+            plugin.wasm
