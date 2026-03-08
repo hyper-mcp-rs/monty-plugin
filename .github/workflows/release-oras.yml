@@ -66,7 +66,7 @@ jobs:
           ls -lh ./plugin.wasm
 
       - name: Upload wasm artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: plugin-wasm
           path: plugin.wasm
@@ -87,7 +87,7 @@ jobs:
       latest_digest: ${{ steps.digest.outputs.latest_digest }}
     steps:
       - name: Download wasm artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: plugin-wasm
           path: .
@@ -181,7 +181,7 @@ jobs:
       contents: write
     steps:
       - name: Download plugin.wasm artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: plugin-wasm
           path: .
