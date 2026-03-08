@@ -140,7 +140,7 @@ jobs:
           echo "nightly_ref=${IMAGE}:nightly" >> "$GITHUB_OUTPUT"
 
       - name: Build and push image (just copies plugin.wasm)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
