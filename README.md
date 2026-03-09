@@ -12,10 +12,23 @@ Because the plugin compiles to a `.wasm` module (`wasm32-wasip1`), it runs in a 
 
 ### Parameters
 
-| Name     | Type                          | Required | Description                                    |
-| -------- | ----------------------------- | -------- | ---------------------------------------------- |
-| `code`   | `string`                      | ✅       | The Python code to execute.                    |
-| `inputs` | `map<string, MontyObject>`    | No       | Input variables passed into the Python runtime. |
+| Name              | Type                          | Required | Description                                    |
+| ----------------- | ----------------------------- | -------- | ---------------------------------------------- |
+| `code`            | `string`                      | ✅       | The Python code to execute.                    |
+| `inputs`          | `map<string, MontyObject>`    | No       | Input variables passed into the Python runtime. |
+| `resource_limits` | `ResourceLimits`              | No       | Execution resource limits for the interpreter. |
+
+#### `ResourceLimits`
+
+All fields are optional. When omitted, the corresponding limit is not enforced (except `max_recursion_depth`, which defaults to `1000`).
+
+| Field                 | Type                              | Description                                          |
+| --------------------- | --------------------------------- | ---------------------------------------------------- |
+| `max_allocations`     | `integer`                         | Maximum number of heap allocations allowed.           |
+| `max_duration`        | `{secs: integer, nanos: integer}` | Maximum execution time.                              |
+| `max_memory`          | `integer`                         | Maximum heap memory in bytes (approximate).           |
+| `gc_interval`         | `integer`                         | Run garbage collection every N allocations.           |
+| `max_recursion_depth` | `integer`                         | Maximum recursion depth (function call stack depth).  |
 
 ### Response
 
