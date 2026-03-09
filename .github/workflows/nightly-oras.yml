@@ -48,10 +48,10 @@ jobs:
           fetch-depth: 0
           submodules: true
 
-      - name: Install Rust 1.93 toolchain + wasm target
+      - name: Install Rust 1.94 toolchain + wasm target
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.93"
+          toolchain: "1.94"
           components: rustc rust-std cargo clippy rustfmt
           targets: wasm32-wasip1
 
