@@ -1212,9 +1212,10 @@ dependencies = [
 [[package]]
 name = "monty"
 version = "0.0.7"
-source = "git+https://github.com/pydantic/monty?rev=24dad05#24dad053ac36cef25951370001c57a5c5bc5a64d"
+source = "git+https://github.com/pydantic/monty?rev=508945d1a4560e1dd494c6714c6aaea413b97c16#508945d1a4560e1dd494c6714c6aaea413b97c16"
 dependencies = [
  "ahash",
+ "fancy-regex",
  "hashbrown",
  "indexmap",
  "itertools",
@@ -1222,6 +1223,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "postcard",
+ "pyo3-build-config",
  "ruff_python_ast",
  "ruff_python_parser",
  "ruff_text_size",
@@ -1535,6 +1537,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "pyo3-build-config"
+version = "0.28.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bf94ee265674bf76c09fa430b0e99c26e319c945d96ca0d5a8215f31bf81cf7"
+dependencies = [
+ "target-lexicon",
 ]
 
 [[package]]
@@ -2198,6 +2209,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "target-lexicon"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tempfile"
