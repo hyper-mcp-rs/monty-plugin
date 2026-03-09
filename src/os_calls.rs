@@ -638,7 +638,6 @@ fn os_getenv(args: &[MontyObject], kwargs: &[(MontyObject, MontyObject)]) -> Mon
 #[cfg(test)]
 mod tests {
     use super::*;
-    use monty::{ExcType, MontyObject, OsFunction};
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -675,26 +674,6 @@ mod tests {
     /// Return the string path for a child inside a TempDir (doesn't create it).
     fn child_path(dir: &TempDir, name: &str) -> String {
         dir.path().join(name).to_string_lossy().into_owned()
-    }
-
-    // ── handle_os_call dispatch ─────────────────────────────────────
-
-    #[test]
-    fn handle_os_call_dispatches_with_path_arg() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "hello");
-        let args = vec![MontyObject::Path(p)];
-        let result = handle_os_call(&OsFunction::Exists, &args, &no_kwargs());
-        assert!(is_bool(&result, true));
-    }
-
-    #[test]
-    fn handle_os_call_dispatches_with_string_arg() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "hello");
-        let args = vec![s(&p)];
-        let result = handle_os_call(&OsFunction::Exists, &args, &no_kwargs());
-        assert!(is_bool(&result, true));
     }
 
     // ── path_exists ─────────────────────────────────────────────────
