@@ -1089,12 +1089,26 @@ pub struct ProgressNotificationParam {
 
     /// A token identifying the progress context
     #[serde(rename = "progressToken")]
-    pub progress_token: String,
+    pub progress_token: ProgressToken,
 
     /// Optional total units of work
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub total: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromBytes, ToBytes)]
+#[encoding(Json)]
+#[serde(untagged)]
+pub enum ProgressToken {
+    String(String),
+    Number(i64),
+}
+
+impl Default for ProgressToken {
+    fn default() -> Self {
+        ProgressToken::String(String::new())
+    }
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, FromBytes, ToBytes)]
