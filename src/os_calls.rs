@@ -61,7 +61,12 @@ pub(crate) fn handle_os_call(
         OsFunction::Resolve => path_resolve(path_str, rest, kwargs),
         OsFunction::Absolute => path_absolute(path_str),
         OsFunction::Getenv => os_getenv(args, kwargs),
-        OsFunction::GetEnviron => os_get_environ(),
+        _ => MontyObject::Exception {
+            exc_type: ExcType::OSError,
+            arg: Some(format!(
+                "OS function {function:?} is not implemented in this runtime"
+            )),
+        },
     }
 }
 
@@ -620,17 +625,14 @@ fn os_getenv(args: &[MontyObject], kwargs: &[(MontyObject, MontyObject)]) -> Mon
         None => MontyObject::None,
     };
 
-    match std::env::var(&key) {
-        Ok(val) => MontyObject::String(val),
-        Err(_) => default,
+    match extism_pdk::config::get(&key) {
+        Ok(Some(val)) => MontyObject::String(val),
+        Ok(None) => default,
+        Err(e) => MontyObject::Exception {
+            exc_type: ExcType::OSError,
+            arg: Some(format!("os.getenv: Error getting {key}: {e}")),
+        },
     }
-}
-
-fn os_get_environ() -> MontyObject {
-    let pairs: Vec<(MontyObject, MontyObject)> = std::env::vars()
-        .map(|(k, v)| (MontyObject::String(k), MontyObject::String(v)))
-        .collect();
-    MontyObject::Dict(pairs.into())
 }
 
 #[cfg(test)]
@@ -693,20 +695,6 @@ mod tests {
         let args = vec![s(&p)];
         let result = handle_os_call(&OsFunction::Exists, &args, &no_kwargs());
         assert!(is_bool(&result, true));
-    }
-
-    #[test]
-    fn handle_os_call_dispatches_getenv() {
-        // Getenv receives the raw args (no path extraction).
-        let args = vec![s("PATH")];
-        let result = handle_os_call(&OsFunction::Getenv, &args, &no_kwargs());
-        assert!(matches!(result, MontyObject::String(_)));
-    }
-
-    #[test]
-    fn handle_os_call_dispatches_get_environ() {
-        let result = handle_os_call(&OsFunction::GetEnviron, &[], &no_kwargs());
-        assert!(matches!(result, MontyObject::Dict(_)));
     }
 
     // ── path_exists ─────────────────────────────────────────────────
@@ -1596,110 +1584,6 @@ mod tests {
     fn path_absolute_no_path_returns_empty_string() {
         let result = path_absolute(None);
         assert!(matches!(result, MontyObject::String(ref s) if s.is_empty()));
-    }
-
-    // ── os_getenv ───────────────────────────────────────────────────
-
-    #[test]
-    fn os_getenv_existing_var() {
-        // PATH should exist on all platforms
-        let args = vec![s("PATH")];
-        let result = os_getenv(&args, &no_kwargs());
-        assert!(matches!(result, MontyObject::String(_)));
-    }
-
-    #[test]
-    fn os_getenv_nonexistent_returns_none() {
-        let args = vec![s("__MONTY_PLUGIN_TEST_NONEXISTENT_VAR__")];
-        let result = os_getenv(&args, &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
-    }
-
-    #[test]
-    fn os_getenv_nonexistent_with_default() {
-        let args = vec![s("__MONTY_PLUGIN_TEST_NONEXISTENT_VAR__"), s("fallback")];
-        let result = os_getenv(&args, &no_kwargs());
-        assert!(matches!(result, MontyObject::String(ref s) if s == "fallback"));
-    }
-
-    #[test]
-    fn os_getenv_nonexistent_with_int_default() {
-        let args = vec![
-            s("__MONTY_PLUGIN_TEST_NONEXISTENT_VAR__"),
-            MontyObject::Int(42),
-        ];
-        let result = os_getenv(&args, &no_kwargs());
-        assert!(matches!(result, MontyObject::Int(42)));
-    }
-
-    #[test]
-    fn os_getenv_missing_key() {
-        let result = os_getenv(&[], &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::TypeError));
-        if let MontyObject::Exception { arg, .. } = &result {
-            assert!(arg.as_ref().unwrap().contains("key"));
-        }
-    }
-
-    #[test]
-    fn os_getenv_key_wrong_type() {
-        let args = vec![MontyObject::Int(123)];
-        let result = os_getenv(&args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::TypeError));
-    }
-
-    #[test]
-    fn os_getenv_via_kwargs() {
-        let kwargs = vec![kwarg("key", s("PATH"))];
-        let result = os_getenv(&[], &kwargs);
-        assert!(matches!(result, MontyObject::String(_)));
-    }
-
-    #[test]
-    fn os_getenv_default_via_kwarg() {
-        let kwargs = vec![
-            kwarg("key", s("__MONTY_PLUGIN_TEST_NONEXISTENT_VAR__")),
-            kwarg("default", s("kwarg_fallback")),
-        ];
-        let result = os_getenv(&[], &kwargs);
-        assert!(matches!(result, MontyObject::String(ref s) if s == "kwarg_fallback"));
-    }
-
-    // ── os_get_environ ──────────────────────────────────────────────
-
-    #[test]
-    fn os_get_environ_returns_dict() {
-        let result = os_get_environ();
-        assert!(matches!(result, MontyObject::Dict(_)));
-    }
-
-    #[test]
-    fn os_get_environ_contains_path() {
-        let result = os_get_environ();
-        // Serialize to JSON and check for "PATH" key in the dict pairs
-        let json = serde_json::to_value(&result).unwrap();
-        let pairs = json.get("Dict").unwrap().as_array().unwrap();
-        let has_path = pairs.iter().any(|pair| {
-            pair.as_array()
-                .and_then(|a| a.first())
-                .and_then(|k| k.get("String"))
-                .and_then(|s| s.as_str())
-                .is_some_and(|s| s == "PATH")
-        });
-        assert!(has_path, "expected PATH in environ");
-    }
-
-    #[test]
-    fn os_get_environ_all_entries_are_string_pairs() {
-        let result = os_get_environ();
-        let json = serde_json::to_value(&result).unwrap();
-        let pairs = json.get("Dict").unwrap().as_array().unwrap();
-        for pair in pairs {
-            let arr = pair.as_array().unwrap();
-            assert_eq!(arr.len(), 2);
-            assert!(arr[0].get("String").is_some(), "key should be String");
-            assert!(arr[1].get("String").is_some(), "value should be String");
-        }
     }
 
     // ── write then read round-trips ─────────────────────────────────
