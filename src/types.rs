@@ -1,3 +1,4 @@
+use monty::{MontyObject, ResourceLimits};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -5,28 +6,28 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct PluginMontyObject(pub monty::MontyObject);
+pub struct PluginMontyObject(pub MontyObject);
 
-impl From<monty::MontyObject> for PluginMontyObject {
-    fn from(value: monty::MontyObject) -> Self {
+impl From<MontyObject> for PluginMontyObject {
+    fn from(value: MontyObject) -> Self {
         Self(value)
     }
 }
 
-impl From<PluginMontyObject> for monty::MontyObject {
+impl From<PluginMontyObject> for MontyObject {
     fn from(value: PluginMontyObject) -> Self {
         value.0
     }
 }
 
-impl AsRef<monty::MontyObject> for PluginMontyObject {
-    fn as_ref(&self) -> &monty::MontyObject {
+impl AsRef<MontyObject> for PluginMontyObject {
+    fn as_ref(&self) -> &MontyObject {
         &self.0
     }
 }
 
 impl std::ops::Deref for PluginMontyObject {
-    type Target = monty::MontyObject;
+    type Target = MontyObject;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -34,7 +35,7 @@ impl std::ops::Deref for PluginMontyObject {
 }
 
 impl PluginMontyObject {
-    pub fn into_inner(self) -> monty::MontyObject {
+    pub fn into_inner(self) -> MontyObject {
         self.0
     }
 }
@@ -521,6 +522,89 @@ impl JsonSchema for PluginMontyObject {
     }
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PluginResourceLimits(pub ResourceLimits);
+
+impl From<PluginResourceLimits> for ResourceLimits {
+    fn from(value: PluginResourceLimits) -> Self {
+        value.0
+    }
+}
+
+impl std::ops::Deref for PluginResourceLimits {
+    type Target = ResourceLimits;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl PluginResourceLimits {
+    pub fn into_inner(self) -> ResourceLimits {
+        self.0
+    }
+}
+
+impl JsonSchema for PluginResourceLimits {
+    fn inline_schema() -> bool {
+        false
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "object",
+            "properties": {
+                "max_allocations": {
+                    "description": "Maximum number of heap allocations allowed.",
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "max_duration": {
+                    "description": "Maximum execution time.",
+                    "type": "object",
+                    "properties": {
+                        "secs": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "nanos": {
+                            "type": "integer",
+                            "minimum": 0
+                        }
+                    },
+                    "required": ["secs", "nanos"],
+                    "additionalProperties": false
+                },
+                "max_memory": {
+                    "description": "Maximum heap memory in bytes (approximate).",
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "gc_interval": {
+                    "description": "Run garbage collection every N allocations.",
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "max_recursion_depth": {
+                    "description": "Maximum recursion depth (function call stack depth).",
+                    "type": "integer",
+                    "minimum": 0
+                }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "ResourceLimits").into()
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ResourceLimits".into()
+    }
+}
+
 /// Input for the `run` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunArguments {
@@ -530,6 +614,8 @@ pub struct RunArguments {
     /// Input variables as a map of name to value.
     #[serde(default)]
     pub inputs: HashMap<String, PluginMontyObject>,
+
+    pub resource_limits: Option<PluginResourceLimits>,
 }
 
 /// Output returned by the `run` tool.
@@ -957,6 +1043,7 @@ mod tests {
                 m.insert("x".into(), PluginMontyObject(MontyObject::Int(3)));
                 m
             },
+            resource_limits: None,
         };
         let json = serde_json::to_value(&args).unwrap();
         let back: RunArguments = serde_json::from_value(json).unwrap();

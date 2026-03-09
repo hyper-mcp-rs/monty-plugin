@@ -6,7 +6,7 @@ mod types;
 
 use anyhow::{Result, anyhow};
 use function_calls::{BUILTIN_FUNCTIONS_DESCRIPTION, EXTERNAL_FUNCTIONS, handle_function_call};
-use monty::{ExternalResult, MontyObject, MontyRun, NoLimitTracker, PrintWriter, RunProgress};
+use monty::{ExternalResult, LimitedTracker, MontyObject, MontyRun, PrintWriter, RunProgress};
 use os_calls::{OS_CALLS_DESCRIPTION, handle_os_call};
 use pdk::types::*;
 use serde_json::{Map, Value};
@@ -45,7 +45,11 @@ fn run_monty(input: RunArguments, progress_token: Option<&ProgressToken>) -> Res
     let mut writer = PrintWriter::Collect(String::new());
 
     let mut progress = runner
-        .start(monty_inputs, NoLimitTracker, &mut writer)
+        .start(
+            monty_inputs,
+            LimitedTracker::new(input.resource_limits.unwrap_or_default().into_inner()),
+            &mut writer,
+        )
         .map_err(|e| anyhow!("monty start failed: {e}"))?;
 
     loop {
