@@ -35,7 +35,7 @@ jobs:
       - name: Install Rust toolchain + wasm target
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.93.1"
+          toolchain: "1.94"
           components: rustc rust-std cargo clippy rustfmt
           targets: wasm32-wasip1
 
@@ -55,8 +55,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.93.1 fetch
-          cargo +1.93.1 auditable build --release --target wasm32-wasip1
+          cargo +1.94 fetch
+          cargo +1.94 auditable build --release --target wasm32-wasip1
           cp target/wasm32-wasip1/release/plugin.wasm ./plugin.wasm
 
       - name: Ensure plugin.wasm exists
