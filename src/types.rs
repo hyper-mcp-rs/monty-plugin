@@ -570,7 +570,8 @@ impl JsonSchema for PluginResourceLimits {
                         },
                         "nanos": {
                             "type": "integer",
-                            "minimum": 0
+                            "minimum": 0,
+                            "maximum": 1_000_000_000
                         }
                     },
                     "required": ["secs", "nanos"],
