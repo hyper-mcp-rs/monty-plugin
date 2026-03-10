@@ -1,5 +1,8 @@
 # monty-plugin
 
+> [!WARNING]
+> This plugin, like [Monty](https://github.com/pydantic/monty) itself, is experimental. Expect breaking changes and incomplete functionality.
+
 A [hyper-mcp](https://github.com/pydantic/hyper-mcp) plugin that executes Python code in a sandboxed [Monty](https://github.com/pydantic/monty) interpreter, compiled to WebAssembly.
 
 ## Overview
