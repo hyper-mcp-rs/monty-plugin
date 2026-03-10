@@ -4,12 +4,6 @@ use extism_pdk::{HttpRequest, http};
 use monty::{ExcType, MontyObject};
 use std::collections::BTreeMap;
 
-// ---------------------------------------------------------------------------
-// Monty external-function names the Python code is allowed to call
-// ---------------------------------------------------------------------------
-
-pub(crate) const EXTERNAL_FUNCTIONS: &[&str] = &[EXT_HTTP_REQUEST, EXT_NOTIFY_PROGRESS];
-
 /// Markdown description of the built-in functions available to Python code.
 pub(crate) const BUILTIN_FUNCTIONS_DESCRIPTION: &str = "\
 Built-in functions:\n\

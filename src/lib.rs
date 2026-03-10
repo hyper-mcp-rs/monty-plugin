@@ -5,8 +5,8 @@ mod python_args;
 mod types;
 
 use anyhow::{Result, anyhow};
-use function_calls::{BUILTIN_FUNCTIONS_DESCRIPTION, EXTERNAL_FUNCTIONS, handle_function_call};
-use monty::{ExternalResult, LimitedTracker, MontyObject, MontyRun, PrintWriter, RunProgress};
+use function_calls::{BUILTIN_FUNCTIONS_DESCRIPTION, handle_function_call};
+use monty::{ExtFunctionResult, LimitedTracker, MontyObject, MontyRun, PrintWriter, RunProgress};
 use os_calls::{OS_CALLS_DESCRIPTION, handle_os_call};
 use pdk::types::*;
 use serde_json::{Map, Value};
@@ -18,16 +18,9 @@ use types::{PluginMontyObject, RunArguments, RunResponse};
 
 fn run_monty(input: RunArguments, progress_token: Option<&ProgressToken>) -> Result<RunResponse> {
     let input_names: Vec<String> = input.inputs.keys().cloned().collect();
-    let external_functions: Vec<String> =
-        EXTERNAL_FUNCTIONS.iter().map(|s| s.to_string()).collect();
 
-    let runner = MontyRun::new(
-        input.code.clone(),
-        "plugin.py",
-        input_names.clone(),
-        external_functions,
-    )
-    .map_err(|e| anyhow!("failed to parse Python code: {e}"))?;
+    let runner = MontyRun::new(input.code.clone(), "plugin.py", input_names.clone())
+        .map_err(|e| anyhow!("failed to parse Python code: {e}"))?;
 
     // Convert inputs in the same order as input_names
     let monty_inputs: Vec<MontyObject> = input_names
@@ -42,62 +35,56 @@ fn run_monty(input: RunArguments, progress_token: Option<&ProgressToken>) -> Res
         })
         .collect();
 
-    let mut writer = PrintWriter::Collect(String::new());
+    let mut output_buf = String::new();
+    let mut writer = PrintWriter::Collect(&mut output_buf);
 
     let mut progress = runner
         .start(
             monty_inputs,
             LimitedTracker::new(input.resource_limits.unwrap_or_default().into_inner()),
-            &mut writer,
+            writer.reborrow(),
         )
         .map_err(|e| anyhow!("monty start failed: {e}"))?;
 
     loop {
         match progress {
             RunProgress::Complete(result) => {
-                // Recover the collected print output
                 return Ok(RunResponse {
-                    output: match &writer {
-                        PrintWriter::Collect(buf) => buf.to_owned(),
-                        _ => String::new(),
-                    },
+                    output: output_buf,
                     result: result.into(),
                 });
             }
-            RunProgress::FunctionCall {
-                function_name,
-                args,
-                kwargs,
-                state,
-                ..
-            } => {
-                progress = state
-                    .run(
-                        handle_function_call(&function_name, &args, &kwargs, progress_token),
-                        &mut writer,
-                    )
+            RunProgress::FunctionCall(call) => {
+                let result = handle_function_call(
+                    &call.function_name,
+                    &call.args,
+                    &call.kwargs,
+                    progress_token,
+                );
+                progress = call
+                    .resume(result, writer.reborrow())
                     .map_err(|e| anyhow!("monty resume after FunctionCall failed: {e}"))?;
             }
-            RunProgress::OsCall {
-                function,
-                args,
-                kwargs,
-                state,
-                ..
-            } => {
-                progress = state
-                    .run(handle_os_call(&function, &args, &kwargs), &mut writer)
+            RunProgress::OsCall(call) => {
+                let result = handle_os_call(&call.function, &call.args, &call.kwargs);
+                progress = call
+                    .resume(result, writer.reborrow())
                     .map_err(|e| anyhow!("monty resume after OsCall failed: {e}"))?;
             }
             RunProgress::ResolveFutures(futures_state) => {
-                let results: Vec<(u32, ExternalResult)> = futures_state
+                let results: Vec<(u32, ExtFunctionResult)> = futures_state
                     .pending_call_ids()
                     .iter()
-                    .map(|&id| (id, ExternalResult::Return(MontyObject::None)))
+                    .map(|&id| (id, ExtFunctionResult::Return(MontyObject::None)))
                     .collect();
                 progress = futures_state
-                    .resume(results, &mut writer)
+                    .resume(results, writer.reborrow())
                     .map_err(|e| anyhow!("monty resume after ResolveFutures failed: {e}"))?;
+            }
+            RunProgress::NameLookup(lookup) => {
+                progress = lookup
+                    .resume(monty::NameLookupResult::Undefined, writer.reborrow())
+                    .map_err(|e| anyhow!("monty resume after NameLookup failed: {e}"))?;
             }
         }
     }

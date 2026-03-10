@@ -1143,6 +1143,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1211,17 +1217,20 @@ dependencies = [
 
 [[package]]
 name = "monty"
-version = "0.0.7"
-source = "git+https://github.com/pydantic/monty?rev=24dad05#24dad053ac36cef25951370001c57a5c5bc5a64d"
+version = "0.0.8"
+source = "git+https://github.com/pydantic/monty?rev=61770e5#61770e5b88393923fbf45ee1224f374aa9de328e"
 dependencies = [
  "ahash",
+ "fancy-regex",
  "hashbrown",
  "indexmap",
  "itertools",
+ "libm",
  "num-bigint",
  "num-integer",
  "num-traits",
  "postcard",
+ "pyo3-build-config",
  "ruff_python_ast",
  "ruff_python_parser",
  "ruff_text_size",
@@ -1241,7 +1250,7 @@ dependencies = [
  "extism-pdk",
  "git-version",
  "jsonschema",
- "monty 0.0.7",
+ "monty 0.0.8",
  "oauth2",
  "schemars",
  "serde",
@@ -1535,6 +1544,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "pyo3-build-config"
+version = "0.28.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bf94ee265674bf76c09fa430b0e99c26e319c945d96ca0d5a8215f31bf81cf7"
+dependencies = [
+ "target-lexicon",
 ]
 
 [[package]]
@@ -2198,6 +2216,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "target-lexicon"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tempfile"
