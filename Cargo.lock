@@ -1218,7 +1218,7 @@ dependencies = [
 [[package]]
 name = "monty"
 version = "0.0.8"
-source = "git+https://github.com/pydantic/monty?rev=61770e5#61770e5b88393923fbf45ee1224f374aa9de328e"
+source = "git+https://github.com/pydantic/monty?rev=60538204fd9cd420d1a93042bb52f7168fb9fca2#60538204fd9cd420d1a93042bb52f7168fb9fca2"
 dependencies = [
  "ahash",
  "fancy-regex",
