@@ -36,7 +36,7 @@ pub(crate) fn run_monty(
         .collect();
 
     let mut output_buf = String::new();
-    let mut writer = PrintWriter::Collect(&mut output_buf);
+    let mut writer = PrintWriter::CollectString(&mut output_buf);
 
     let mut progress = runner
         .start(
