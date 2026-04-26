@@ -92,8 +92,12 @@ The plugin implements a subset of Python's `pathlib.Path` API:
 
 ## Supported `os` Operations
 
-- `os.environ -> dict[str, str]`
 - `os.getenv(key, default=None) -> str | None`
+
+## Supported `datetime` Operations
+
+- `datetime.datetime.now(tz=None) -> datetime.datetime`
+- `datetime.date.today() -> datetime.date`
 
 ## Building
 

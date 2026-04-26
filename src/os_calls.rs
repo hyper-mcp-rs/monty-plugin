@@ -29,8 +29,11 @@ Supported `pathlib.Path` operations:\n\
 - `Path.absolute() -> str`\n\
 \n\
 Supported `os` operations:\n\
-- `os.environ -> dict[str, str]`\n\
-- `os.getenv(key: str, default=None) -> str | None`";
+- `os.getenv(key: str, default=None) -> str | None`\n\
+\n\
+Supported `datetime` operations:\n\
+- `datetime.datetime.now(tz=None) -> datetime.datetime`\n\
+- `datetime.date.today() -> datetime.date`";
 
 /// Handle OsCalls from the Monty VM.
 pub(crate) fn handle_os_call(
