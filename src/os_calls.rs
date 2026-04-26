@@ -2,7 +2,10 @@ use crate::python_args::{
     get_bool_kwarg, resolve_arg, resolve_bool_arg, resolve_bytes_arg, resolve_int_arg,
     resolve_str_arg,
 };
-use monty::{ExcType, MontyObject, OsFunction, dir_stat, file_stat, symlink_stat};
+use chrono::{Datelike, FixedOffset, Local, Timelike, Utc};
+use monty::{
+    ExcType, MontyDate, MontyDateTime, MontyObject, OsFunction, dir_stat, file_stat, symlink_stat,
+};
 use std::path::Path;
 
 /// Markdown description of the supported `pathlib.Path` and `os` operations.
@@ -44,29 +47,31 @@ pub(crate) fn handle_os_call(
     };
 
     match function {
-        OsFunction::Exists => path_exists(path_str, kwargs),
-        OsFunction::IsFile => path_is_file(path_str, kwargs),
-        OsFunction::IsDir => path_is_dir(path_str, kwargs),
-        OsFunction::IsSymlink => path_is_symlink(path_str),
-        OsFunction::ReadText => path_read_text(path_str, rest, kwargs),
-        OsFunction::ReadBytes => path_read_bytes(path_str),
-        OsFunction::WriteText => path_write_text(path_str, rest, kwargs),
-        OsFunction::WriteBytes => path_write_bytes(path_str, rest, kwargs),
-        OsFunction::Mkdir => path_mkdir(path_str, rest, kwargs),
-        OsFunction::Unlink => path_unlink(path_str, rest, kwargs),
-        OsFunction::Rmdir => path_rmdir(path_str),
-        OsFunction::Iterdir => path_iterdir(path_str),
-        OsFunction::Stat => path_stat(path_str, kwargs),
-        OsFunction::Rename => path_rename(path_str, rest, kwargs),
-        OsFunction::Resolve => path_resolve(path_str, rest, kwargs),
         OsFunction::Absolute => path_absolute(path_str),
+        OsFunction::DateTimeNow => datetime_now(args, kwargs),
+        OsFunction::DateToday => date_today(),
+        OsFunction::Exists => path_exists(path_str, kwargs),
         OsFunction::Getenv => os_getenv(args, kwargs),
-        _ => MontyObject::Exception {
+        OsFunction::GetEnviron => MontyObject::Exception {
             exc_type: ExcType::OSError,
             arg: Some(format!(
                 "OS function {function:?} is not implemented in this runtime"
             )),
         },
+        OsFunction::IsFile => path_is_file(path_str, kwargs),
+        OsFunction::IsDir => path_is_dir(path_str, kwargs),
+        OsFunction::IsSymlink => path_is_symlink(path_str),
+        OsFunction::Iterdir => path_iterdir(path_str),
+        OsFunction::Mkdir => path_mkdir(path_str, rest, kwargs),
+        OsFunction::ReadBytes => path_read_bytes(path_str),
+        OsFunction::ReadText => path_read_text(path_str, rest, kwargs),
+        OsFunction::Rename => path_rename(path_str, rest, kwargs),
+        OsFunction::Resolve => path_resolve(path_str, rest, kwargs),
+        OsFunction::Rmdir => path_rmdir(path_str),
+        OsFunction::Stat => path_stat(path_str, kwargs),
+        OsFunction::Unlink => path_unlink(path_str, rest, kwargs),
+        OsFunction::WriteBytes => path_write_bytes(path_str, rest, kwargs),
+        OsFunction::WriteText => path_write_text(path_str, rest, kwargs),
     }
 }
 
@@ -633,6 +638,67 @@ fn os_getenv(args: &[MontyObject], kwargs: &[(MontyObject, MontyObject)]) -> Mon
             arg: Some(format!("os.getenv: Error getting {key}: {e}")),
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Date and Time
+// ---------------------------------------------------------------------------
+fn datetime_now(args: &[MontyObject], kwargs: &[(MontyObject, MontyObject)]) -> MontyObject {
+    match resolve_arg(args, 0, kwargs, "tz") {
+        Some(MontyObject::TimeZone(tz)) => {
+            let offset = match FixedOffset::east_opt(tz.offset_seconds) {
+                Some(fo) => fo,
+                None => {
+                    return MontyObject::Exception {
+                        exc_type: ExcType::ValueError,
+                        arg: Some(format!(
+                            "'tz' contains an invalid offset ({})",
+                            tz.offset_seconds
+                        )),
+                    };
+                }
+            };
+            let now = Utc::now().with_timezone(&offset);
+            MontyObject::DateTime(MontyDateTime {
+                year: now.year(),
+                month: now.month() as u8,
+                day: now.day() as u8,
+                hour: now.hour() as u8,
+                minute: now.minute() as u8,
+                second: now.second() as u8,
+                microsecond: now.timestamp_subsec_micros(),
+                offset_seconds: Some(now.offset().local_minus_utc()),
+                timezone_name: tz.name.clone(),
+            })
+        }
+        Some(MontyObject::None) | None => {
+            let now = Local::now();
+            MontyObject::DateTime(MontyDateTime {
+                year: now.year(),
+                month: now.month() as u8,
+                day: now.day() as u8,
+                hour: now.hour() as u8,
+                minute: now.minute() as u8,
+                second: now.second() as u8,
+                microsecond: now.timestamp_subsec_micros(),
+                offset_seconds: Some(now.offset().local_minus_utc()),
+                timezone_name: None,
+            })
+        }
+        Some(_) => MontyObject::Exception {
+            exc_type: ExcType::TypeError,
+            arg: Some(format!("datetime.now: 'tz' must be a timezone")),
+        },
+    }
+}
+
+fn date_today() -> MontyObject {
+    let today = Local::now().date_naive();
+    MontyObject::Date(MontyDate {
+        year: today.year(),
+        month: today.month() as u8,
+        day: today.day() as u8,
+    })
 }
 
 #[cfg(test)]
