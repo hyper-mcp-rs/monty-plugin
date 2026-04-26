@@ -687,7 +687,7 @@ fn datetime_now(args: &[MontyObject], kwargs: &[(MontyObject, MontyObject)]) -> 
         }
         Some(_) => MontyObject::Exception {
             exc_type: ExcType::TypeError,
-            arg: Some(format!("datetime.now: 'tz' must be a timezone")),
+            arg: Some("datetime.now: 'tz' must be a timezone".to_string()),
         },
     }
 }
@@ -704,6 +704,7 @@ fn date_today() -> MontyObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use monty::MontyTimeZone;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -1681,5 +1682,216 @@ mod tests {
         let result = path_rmdir(Some(&sub));
         assert!(matches!(result, MontyObject::None));
         assert!(!Path::new(&sub).exists());
+    }
+
+    // ── date_today ──────────────────────────────────────────────────
+
+    #[test]
+    fn date_today_returns_date_variant() {
+        let before = Local::now().date_naive();
+        let result = date_today();
+        let after = Local::now().date_naive();
+
+        match result {
+            MontyObject::Date(d) => {
+                // Allow for the rare case where the date rolls over during
+                // the call by accepting either `before` or `after`.
+                let year_ok = d.year == before.year() || d.year == after.year();
+                let month_ok = d.month == before.month() as u8 || d.month == after.month() as u8;
+                let day_ok = d.day == before.day() as u8 || d.day == after.day() as u8;
+                assert!(year_ok, "year mismatch: got {}", d.year);
+                assert!(month_ok, "month mismatch: got {}", d.month);
+                assert!(day_ok, "day mismatch: got {}", d.day);
+            }
+            other => panic!("expected Date, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn date_today_fields_in_valid_ranges() {
+        if let MontyObject::Date(d) = date_today() {
+            assert!((1..=9999).contains(&d.year));
+            assert!((1..=12).contains(&d.month));
+            assert!((1..=31).contains(&d.day));
+        } else {
+            panic!("expected Date");
+        }
+    }
+
+    // ── datetime_now ────────────────────────────────────────────────
+
+    #[test]
+    fn datetime_now_no_args_returns_local_datetime() {
+        let before = Local::now();
+        let result = datetime_now(&[], &no_kwargs());
+        let after = Local::now();
+
+        match result {
+            MontyObject::DateTime(dt) => {
+                assert!(dt.offset_seconds.is_some(), "expected aware datetime");
+                assert!(dt.timezone_name.is_none(), "expected no explicit tz name");
+                assert!(
+                    dt.year == before.year() || dt.year == after.year(),
+                    "year mismatch"
+                );
+                let local_offset = before.offset().local_minus_utc();
+                assert_eq!(dt.offset_seconds, Some(local_offset));
+            }
+            other => panic!("expected DateTime, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn datetime_now_no_args_fields_in_valid_ranges() {
+        if let MontyObject::DateTime(dt) = datetime_now(&[], &no_kwargs()) {
+            assert!((1..=9999).contains(&dt.year));
+            assert!((1..=12).contains(&dt.month));
+            assert!((1..=31).contains(&dt.day));
+            assert!(dt.hour <= 23);
+            assert!(dt.minute <= 59);
+            assert!(dt.second <= 59);
+            assert!(dt.microsecond <= 999_999);
+        } else {
+            panic!("expected DateTime");
+        }
+    }
+
+    #[test]
+    fn datetime_now_with_none_tz_returns_local_datetime() {
+        let result = datetime_now(&[MontyObject::None], &no_kwargs());
+        match result {
+            MontyObject::DateTime(dt) => {
+                assert!(dt.offset_seconds.is_some());
+                assert!(dt.timezone_name.is_none());
+            }
+            other => panic!("expected DateTime, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn datetime_now_with_utc_timezone() {
+        let tz = MontyObject::TimeZone(MontyTimeZone {
+            offset_seconds: 0,
+            name: Some("UTC".to_string()),
+        });
+        let result = datetime_now(&[tz], &no_kwargs());
+        match result {
+            MontyObject::DateTime(dt) => {
+                assert_eq!(dt.offset_seconds, Some(0));
+                assert_eq!(dt.timezone_name, Some("UTC".to_string()));
+            }
+            other => panic!("expected DateTime, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn datetime_now_with_positive_offset_timezone() {
+        let offset = 5 * 3600 + 30 * 60; // +05:30
+        let tz = MontyObject::TimeZone(MontyTimeZone {
+            offset_seconds: offset,
+            name: Some("Asia/Kolkata".to_string()),
+        });
+        let result = datetime_now(&[tz], &no_kwargs());
+        match result {
+            MontyObject::DateTime(dt) => {
+                assert_eq!(dt.offset_seconds, Some(offset));
+                assert_eq!(dt.timezone_name, Some("Asia/Kolkata".to_string()));
+            }
+            other => panic!("expected DateTime, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn datetime_now_with_negative_offset_timezone() {
+        let offset = -(5 * 3600); // -05:00
+        let tz = MontyObject::TimeZone(MontyTimeZone {
+            offset_seconds: offset,
+            name: None,
+        });
+        let result = datetime_now(&[tz], &no_kwargs());
+        match result {
+            MontyObject::DateTime(dt) => {
+                assert_eq!(dt.offset_seconds, Some(offset));
+                assert!(dt.timezone_name.is_none());
+            }
+            other => panic!("expected DateTime, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn datetime_now_tz_via_kwarg() {
+        let tz = MontyObject::TimeZone(MontyTimeZone {
+            offset_seconds: 3600,
+            name: Some("CET".to_string()),
+        });
+        let kwargs = vec![kwarg("tz", tz)];
+        let result = datetime_now(&[], &kwargs);
+        match result {
+            MontyObject::DateTime(dt) => {
+                assert_eq!(dt.offset_seconds, Some(3600));
+                assert_eq!(dt.timezone_name, Some("CET".to_string()));
+            }
+            other => panic!("expected DateTime, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn datetime_now_none_tz_via_kwarg() {
+        let kwargs = vec![kwarg("tz", MontyObject::None)];
+        let result = datetime_now(&[], &kwargs);
+        match result {
+            MontyObject::DateTime(dt) => {
+                assert!(dt.offset_seconds.is_some());
+                assert!(dt.timezone_name.is_none());
+            }
+            other => panic!("expected DateTime, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn datetime_now_wrong_tz_type_returns_type_error() {
+        let result = datetime_now(&[s("not a timezone")], &no_kwargs());
+        assert!(is_exception_of(&result, ExcType::TypeError));
+    }
+
+    #[test]
+    fn datetime_now_int_tz_returns_type_error() {
+        let result = datetime_now(&[MontyObject::Int(42)], &no_kwargs());
+        assert!(is_exception_of(&result, ExcType::TypeError));
+    }
+
+    #[test]
+    fn datetime_now_invalid_offset_returns_value_error() {
+        // chrono::FixedOffset::east_opt rejects offsets >= 86_400 seconds
+        let tz = MontyObject::TimeZone(MontyTimeZone {
+            offset_seconds: 100_000,
+            name: None,
+        });
+        let result = datetime_now(&[tz], &no_kwargs());
+        assert!(is_exception_of(&result, ExcType::ValueError));
+    }
+
+    #[test]
+    fn datetime_now_utc_timezone_matches_utc_clock() {
+        let tz = MontyObject::TimeZone(MontyTimeZone {
+            offset_seconds: 0,
+            name: Some("UTC".to_string()),
+        });
+        let before = Utc::now();
+        let result = datetime_now(&[tz], &no_kwargs());
+        let after = Utc::now();
+
+        if let MontyObject::DateTime(dt) = result {
+            // The hour should be one of the two observations
+            assert!(
+                dt.hour == before.hour() as u8 || dt.hour == after.hour() as u8,
+                "hour mismatch: got {}, expected {} or {}",
+                dt.hour,
+                before.hour(),
+                after.hour()
+            );
+        } else {
+            panic!("expected DateTime");
+        }
     }
 }
