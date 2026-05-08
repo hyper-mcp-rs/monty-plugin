@@ -3,7 +3,7 @@
 > [!WARNING]
 > This plugin, like [Monty](https://github.com/pydantic/monty) itself, is experimental. Expect breaking changes and incomplete functionality.
 
-A [hyper-mcp](https://github.com/pydantic/hyper-mcp) plugin that executes Python code in a sandboxed [Monty](https://github.com/pydantic/monty) interpreter, compiled to WebAssembly.
+A [hyper-mcp](https://github.com/hyper-mcp-rs/hyper-mcp) plugin that executes Python code in a sandboxed [Monty](https://github.com/pydantic/monty) interpreter, compiled to WebAssembly.
 
 ## Overview
 
@@ -127,7 +127,7 @@ Add the plugin to your hyper-mcp configuration. You can reference the OCI artifa
 ```json
 {
   "name": "monty",
-  "oci": "ghcr.io/pydantic/monty-plugin:latest"
+  "oci": "ghcr.io/hyper-mcp-rs/monty-plugin:latest"
 }
 ```
 
@@ -136,23 +136,23 @@ Or pin to a specific version tag:
 ```json
 {
   "name": "monty",
-  "oci": "ghcr.io/pydantic/monty-plugin:v0.1.0"
+  "oci": "ghcr.io/hyper-mcp-rs/monty-plugin:v0.1.0"
 }
 ```
 
 You can pull the artifact directly with [ORAS](https://oras.land/):
 
 ```sh
-oras pull ghcr.io/pydantic/monty-plugin:latest
+oras pull ghcr.io/hyper-mcp-rs/monty-plugin:latest
 ```
 
 All release artifacts are signed with [Cosign](https://docs.sigstore.dev/cosign/overview/). Verify with:
 
 ```sh
 cosign verify \
-  --certificate-identity-regexp "https://github.com/pydantic/monty-plugin/.github/workflows/" \
+  --certificate-identity-regexp "https://github.com/hyper-mcp-rs/monty-plugin/.github/workflows/" \
   --certificate-oidc-issuer-regexp "https://token.actions.githubusercontent.com" \
-  ghcr.io/pydantic/monty-plugin:latest
+  ghcr.io/hyper-mcp-rs/monty-plugin:latest
 ```
 
 ## Docker
