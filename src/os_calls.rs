@@ -4,7 +4,8 @@ use crate::python_args::{
 };
 use chrono::{Datelike, FixedOffset, Local, Timelike, Utc};
 use monty::{
-    ExcType, MontyDate, MontyDateTime, MontyObject, OsFunction, dir_stat, file_stat, symlink_stat,
+    ExcType, MontyDate, MontyDateTime, MontyObject, OsFunctionCall, dir_stat, file_stat,
+    symlink_stat,
 };
 use std::path::Path;
 
@@ -36,45 +37,101 @@ Supported `datetime` operations:\n\
 - `datetime.date.today() -> datetime.date`";
 
 /// Handle OsCalls from the Monty VM.
-pub(crate) fn handle_os_call(
-    function: &OsFunction,
-    args: &[MontyObject],
-    kwargs: &[(MontyObject, MontyObject)],
-) -> MontyObject {
+///
+/// Monty now hands us a tagged [`OsFunctionCall`] whose variants carry the
+/// typed args directly. We capture the variant, then project the call into the
+/// generic `(positional, keyword)` `MontyObject` view that the per-function
+/// handlers below consume.
+pub(crate) fn handle_os_call(call: OsFunctionCall) -> MontyObject {
+    // Local dispatch tag captured before `to_args` consumes the call.
+    enum Kind {
+        Absolute,
+        DateTimeNow,
+        DateToday,
+        Exists,
+        Getenv,
+        IsFile,
+        IsDir,
+        IsSymlink,
+        Iterdir,
+        Mkdir,
+        ReadBytes,
+        ReadText,
+        Rename,
+        Resolve,
+        Rmdir,
+        Stat,
+        Unlink,
+        WriteBytes,
+        WriteText,
+    }
+
+    let kind = match &call {
+        OsFunctionCall::Absolute(_) => Kind::Absolute,
+        OsFunctionCall::DateTimeNow(_) => Kind::DateTimeNow,
+        OsFunctionCall::DateToday => Kind::DateToday,
+        OsFunctionCall::Exists(_) => Kind::Exists,
+        OsFunctionCall::Getenv(_) => Kind::Getenv,
+        OsFunctionCall::GetEnviron => {
+            return MontyObject::Exception {
+                exc_type: ExcType::OSError,
+                arg: Some("OS function os.environ is not implemented in this runtime".to_string()),
+            };
+        }
+        OsFunctionCall::IsFile(_) => Kind::IsFile,
+        OsFunctionCall::IsDir(_) => Kind::IsDir,
+        OsFunctionCall::IsSymlink(_) => Kind::IsSymlink,
+        OsFunctionCall::Iterdir(_) => Kind::Iterdir,
+        OsFunctionCall::Mkdir(_) => Kind::Mkdir,
+        OsFunctionCall::ReadBytes(_) => Kind::ReadBytes,
+        OsFunctionCall::ReadText(_) => Kind::ReadText,
+        OsFunctionCall::Rename(_) => Kind::Rename,
+        OsFunctionCall::Resolve(_) => Kind::Resolve,
+        OsFunctionCall::Rmdir(_) => Kind::Rmdir,
+        OsFunctionCall::Stat(_) => Kind::Stat,
+        OsFunctionCall::Unlink(_) => Kind::Unlink,
+        OsFunctionCall::WriteBytes(_) => Kind::WriteBytes,
+        OsFunctionCall::WriteText(_) => Kind::WriteText,
+        other => {
+            return MontyObject::Exception {
+                exc_type: ExcType::OSError,
+                arg: Some(format!(
+                    "OS function {other} is not implemented in this runtime"
+                )),
+            };
+        }
+    };
+
+    let (args, kwargs) = call.to_args();
+
     // Extract the path string from the first arg (if present) and slice
     // the remaining args so that callees index from 0.
     let (path_str, rest) = match args.first() {
         Some(MontyObject::Path(p)) => (Some(p.as_str()), &args[1..]),
         Some(MontyObject::String(s)) => (Some(s.as_str()), &args[1..]),
-        _ => (None, args),
+        _ => (None, args.as_slice()),
     };
 
-    match function {
-        OsFunction::Absolute => path_absolute(path_str),
-        OsFunction::DateTimeNow => datetime_now(args, kwargs),
-        OsFunction::DateToday => date_today(),
-        OsFunction::Exists => path_exists(path_str, kwargs),
-        OsFunction::Getenv => os_getenv(args, kwargs),
-        OsFunction::GetEnviron => MontyObject::Exception {
-            exc_type: ExcType::OSError,
-            arg: Some(format!(
-                "OS function {function:?} is not implemented in this runtime"
-            )),
-        },
-        OsFunction::IsFile => path_is_file(path_str, kwargs),
-        OsFunction::IsDir => path_is_dir(path_str, kwargs),
-        OsFunction::IsSymlink => path_is_symlink(path_str),
-        OsFunction::Iterdir => path_iterdir(path_str),
-        OsFunction::Mkdir => path_mkdir(path_str, rest, kwargs),
-        OsFunction::ReadBytes => path_read_bytes(path_str),
-        OsFunction::ReadText => path_read_text(path_str, rest, kwargs),
-        OsFunction::Rename => path_rename(path_str, rest, kwargs),
-        OsFunction::Resolve => path_resolve(path_str, rest, kwargs),
-        OsFunction::Rmdir => path_rmdir(path_str),
-        OsFunction::Stat => path_stat(path_str, kwargs),
-        OsFunction::Unlink => path_unlink(path_str, rest, kwargs),
-        OsFunction::WriteBytes => path_write_bytes(path_str, rest, kwargs),
-        OsFunction::WriteText => path_write_text(path_str, rest, kwargs),
+    match kind {
+        Kind::Absolute => path_absolute(path_str),
+        Kind::DateTimeNow => datetime_now(&args, &kwargs),
+        Kind::DateToday => date_today(),
+        Kind::Exists => path_exists(path_str, &kwargs),
+        Kind::Getenv => os_getenv(&args, &kwargs),
+        Kind::IsFile => path_is_file(path_str, &kwargs),
+        Kind::IsDir => path_is_dir(path_str, &kwargs),
+        Kind::IsSymlink => path_is_symlink(path_str),
+        Kind::Iterdir => path_iterdir(path_str),
+        Kind::Mkdir => path_mkdir(path_str, rest, &kwargs),
+        Kind::ReadBytes => path_read_bytes(path_str),
+        Kind::ReadText => path_read_text(path_str, rest, &kwargs),
+        Kind::Rename => path_rename(path_str, rest, &kwargs),
+        Kind::Resolve => path_resolve(path_str, rest, &kwargs),
+        Kind::Rmdir => path_rmdir(path_str),
+        Kind::Stat => path_stat(path_str, &kwargs),
+        Kind::Unlink => path_unlink(path_str, rest, &kwargs),
+        Kind::WriteBytes => path_write_bytes(path_str, rest, &kwargs),
+        Kind::WriteText => path_write_text(path_str, rest, &kwargs),
     }
 }
 

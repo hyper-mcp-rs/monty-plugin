@@ -1,7 +1,8 @@
 use crate::types::{PluginMontyObject, RunArguments, RunResponse};
 use anyhow::{Result, anyhow};
 use monty::{
-    ExtFunctionResult, LimitedTracker, MontyObject, MontyRun, OsFunction, PrintWriter, RunProgress,
+    ExtFunctionResult, LimitedTracker, MontyObject, MontyRun, OsFunctionCall, PrintWriter,
+    RunProgress,
 };
 
 pub(crate) fn run_monty(
@@ -11,11 +12,7 @@ pub(crate) fn run_monty(
         &[MontyObject],
         &[(MontyObject, MontyObject)],
     ) -> MontyObject,
-    mut handle_os_call: impl FnMut(
-        &OsFunction,
-        &[MontyObject],
-        &[(MontyObject, MontyObject)],
-    ) -> MontyObject,
+    mut handle_os_call: impl FnMut(OsFunctionCall) -> MontyObject,
 ) -> Result<RunResponse> {
     let input_names: Vec<String> = input.inputs.keys().cloned().collect();
 
@@ -60,8 +57,12 @@ pub(crate) fn run_monty(
                     .resume(result, writer.reborrow())
                     .map_err(|e| anyhow!("monty resume after FunctionCall failed: {e}"))?;
             }
-            RunProgress::OsCall(call) => {
-                let result = handle_os_call(&call.function, &call.args, &call.kwargs);
+            RunProgress::OsCall(mut call) => {
+                // Move the typed call out (leaving a `Used` placeholder) so we
+                // can dispatch without cloning large write payloads; `resume`
+                // remains valid afterwards.
+                let function_call = call.take_function_call();
+                let result = handle_os_call(function_call);
                 progress = call
                     .resume(result, writer.reborrow())
                     .map_err(|e| anyhow!("monty resume after OsCall failed: {e}"))?;
@@ -88,7 +89,7 @@ pub(crate) fn run_monty(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use monty::{ExcType, OsFunction};
+    use monty::{ExcType, OsFunctionCall};
     use std::collections::HashMap;
 
     // ---------------------------------------------------------------------
@@ -184,19 +185,11 @@ mod tests {
     /// - `IsFile`    — returns `True` for `/hello.txt`
     /// - `IsDir`     — returns `True` for `/data`
     /// - everything else → OSError
-    fn stub_os_call(
-        function: &OsFunction,
-        args: &[MontyObject],
-        _kwargs: &[(MontyObject, MontyObject)],
-    ) -> MontyObject {
-        let path = args.first().and_then(|a| match a {
-            MontyObject::Path(p) => Some(p.as_str()),
-            MontyObject::String(s) => Some(s.as_str()),
-            _ => None,
-        });
+    fn stub_os_call(call: OsFunctionCall) -> MontyObject {
+        let path = call.primary_path();
 
-        match function {
-            OsFunction::ReadText => match path {
+        match &call {
+            OsFunctionCall::ReadText(_) => match path {
                 Some("/hello.txt") => MontyObject::String("hello world".into()),
                 Some(p) => MontyObject::Exception {
                     exc_type: ExcType::OSError,
@@ -207,20 +200,20 @@ mod tests {
                     arg: Some("read_text: no path provided".into()),
                 },
             },
-            OsFunction::Exists => match path {
+            OsFunctionCall::Exists(_) => match path {
                 Some("/hello.txt" | "/data") => MontyObject::Bool(true),
                 _ => MontyObject::Bool(false),
             },
-            OsFunction::IsFile => match path {
+            OsFunctionCall::IsFile(_) => match path {
                 Some("/hello.txt") => MontyObject::Bool(true),
                 _ => MontyObject::Bool(false),
             },
-            OsFunction::IsDir => match path {
+            OsFunctionCall::IsDir(_) => match path {
                 Some("/data") => MontyObject::Bool(true),
                 _ => MontyObject::Bool(false),
             },
-            OsFunction::WriteText => MontyObject::None,
-            OsFunction::Iterdir => match path {
+            OsFunctionCall::WriteText(_) => MontyObject::None,
+            OsFunctionCall::Iterdir(_) => match path {
                 Some("/data") => MontyObject::List(vec![
                     MontyObject::String("a.txt".into()),
                     MontyObject::String("b.txt".into()),
@@ -229,7 +222,7 @@ mod tests {
             },
             other => MontyObject::Exception {
                 exc_type: ExcType::OSError,
-                arg: Some(format!("unsupported OS call in test: {other:?}")),
+                arg: Some(format!("unsupported OS call in test: {}", other.name())),
             },
         }
     }

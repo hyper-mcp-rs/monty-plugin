@@ -103,7 +103,7 @@ The plugin implements a subset of Python's `pathlib.Path` API:
 
 ### Prerequisites
 
-- **Rust 1.94+** (pinned via `rust-toolchain.toml`)
+- **Rust 1.96+** (pinned via `rust-toolchain.toml`)
 - The `wasm32-wasip1` target
 
 ### Install the WASM target
