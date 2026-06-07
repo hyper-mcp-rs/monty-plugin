@@ -2,7 +2,6 @@ mod function_calls;
 mod monty;
 mod os_calls;
 mod pdk;
-mod python_args;
 mod types;
 
 use crate::{

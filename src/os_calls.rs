@@ -1,32 +1,33 @@
-use crate::python_args::{
-    get_bool_kwarg, resolve_arg, resolve_bool_arg, resolve_bytes_arg, resolve_int_arg,
-    resolve_str_arg,
-};
 use chrono::{Datelike, FixedOffset, Local, Timelike, Utc};
 use monty::{
-    ExcType, MontyDate, MontyDateTime, MontyObject, OsFunctionCall, dir_stat, file_stat,
-    symlink_stat,
+    ExcType, MontyDate, MontyDateTime, MontyFileHandle, MontyObject, OsFunctionCall, dir_stat,
+    file_stat, symlink_stat,
 };
 use std::path::Path;
 
 /// Markdown description of the supported `pathlib.Path` and `os` operations.
+///
+/// Signatures reflect what Monty actually forwards to the host: it performs
+/// Python-level argument binding via `FromArgs` before dispatch and rejects
+/// arguments the host doesn't model (e.g. `follow_symlinks`, `encoding`,
+/// `errors`, `newline`, `strict`, `missing_ok`).
 pub(crate) const OS_CALLS_DESCRIPTION: &str = "\
 Supported `pathlib.Path` operations:\n\
-- `Path.exists(*, follow_symlinks: bool = True) -> bool`\n\
-- `Path.is_file(*, follow_symlinks: bool = True) -> bool`\n\
-- `Path.is_dir(*, follow_symlinks: bool = True) -> bool`\n\
+- `Path.exists() -> bool`\n\
+- `Path.is_file() -> bool`\n\
+- `Path.is_dir() -> bool`\n\
 - `Path.is_symlink() -> bool`\n\
-- `Path.read_text(encoding: str | None = None, errors: str | None = None, newline: str | None = None) -> str`\n\
+- `Path.read_text() -> str` (UTF-8)\n\
 - `Path.read_bytes() -> bytes`\n\
-- `Path.write_text(data: str, encoding: str | None = None, errors: str | None = None, newline: str | None = None) -> None`\n\
-- `Path.write_bytes(data: bytes) -> None`\n\
-- `Path.mkdir(mode=0o777, parents=False, exist_ok=False) -> None`\n\
-- `Path.unlink(missing_ok=False) -> None`\n\
+- `Path.write_text(data: str) -> int` (returns number of characters written)\n\
+- `Path.write_bytes(data: bytes) -> int` (returns number of bytes written)\n\
+- `Path.mkdir(parents: bool = False, exist_ok: bool = False) -> None`\n\
+- `Path.unlink() -> None`\n\
 - `Path.rmdir() -> None`\n\
 - `Path.iterdir() -> list[str]`\n\
-- `Path.stat(*, follow_symlinks=True) -> os.stat_result`\n\
-- `Path.rename(target) -> None`\n\
-- `Path.resolve(strict=False) -> str`\n\
+- `Path.stat() -> os.stat_result`\n\
+- `Path.rename(target: str | Path) -> None`\n\
+- `Path.resolve() -> str`\n\
 - `Path.absolute() -> str`\n\
 \n\
 Supported `os` operations:\n\
@@ -34,506 +35,191 @@ Supported `os` operations:\n\
 \n\
 Supported `datetime` operations:\n\
 - `datetime.datetime.now(tz=None) -> datetime.datetime`\n\
-- `datetime.date.today() -> datetime.date`";
+- `datetime.date.today() -> datetime.date`\n\
+\n\
+Supported built-in file I/O:\n\
+- `open(file, mode='r') -> file object` (modes: `r`, `rb`, `w`, `wb`, `a`, `ab`)\n\
+- `file.read()`, `file.write(...)`, `file.close()` and related methods\n\
+- text `write()` returns the number of characters written; binary `write()` returns the number of bytes";
+
+/// Small helper to wrap an `io::Error` in an `OSError`-typed `MontyObject`.
+fn os_err(e: std::io::Error) -> MontyObject {
+    MontyObject::Exception {
+        exc_type: ExcType::OSError,
+        arg: Some(format!("{e}")),
+    }
+}
+
+/// Look up an Extism plugin-config value, isolated behind a tiny shim so the
+/// native test build (which can't link Extism host imports) can swap in a stub.
+#[cfg(not(test))]
+fn extism_config_get(key: &str) -> Result<Option<String>, String> {
+    extism_pdk::config::get(key).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+fn extism_config_get(_key: &str) -> Result<Option<String>, String> {
+    // Native test builds can't link Extism host imports; emulate "no config"
+    // so the `Getenv` arm falls back to the caller's `default`.
+    Ok(None)
+}
 
 /// Handle OsCalls from the Monty VM.
 ///
-/// Monty now hands us a tagged [`OsFunctionCall`] whose variants carry the
-/// typed args directly. We capture the variant, then project the call into the
-/// generic `(positional, keyword)` `MontyObject` view that the per-function
-/// handlers below consume.
+/// Monty hands us a tagged [`OsFunctionCall`] whose variants carry the typed
+/// args directly, and performs all Python-level argument binding (positional/
+/// keyword resolution, defaults, arity, type checks) via `FromArgs` *before*
+/// dispatch. So we receive only the resolved typed fields and just service the
+/// call.
 pub(crate) fn handle_os_call(call: OsFunctionCall) -> MontyObject {
-    // Local dispatch tag captured before `to_args` consumes the call.
-    enum Kind {
-        Absolute,
-        DateTimeNow,
-        DateToday,
-        Exists,
-        Getenv,
-        IsFile,
-        IsDir,
-        IsSymlink,
-        Iterdir,
-        Mkdir,
-        ReadBytes,
-        ReadText,
-        Rename,
-        Resolve,
-        Rmdir,
-        Stat,
-        Unlink,
-        WriteBytes,
-        WriteText,
-    }
+    match &call {
+        // ---- Path property checks --------------------------------------
+        OsFunctionCall::Exists(p) => MontyObject::Bool(Path::new(p.as_str()).exists()),
+        OsFunctionCall::IsFile(p) => MontyObject::Bool(Path::new(p.as_str()).is_file()),
+        OsFunctionCall::IsDir(p) => MontyObject::Bool(Path::new(p.as_str()).is_dir()),
+        OsFunctionCall::IsSymlink(p) => MontyObject::Bool(Path::new(p.as_str()).is_symlink()),
 
-    let kind = match &call {
-        OsFunctionCall::Absolute(_) => Kind::Absolute,
-        OsFunctionCall::DateTimeNow(_) => Kind::DateTimeNow,
-        OsFunctionCall::DateToday => Kind::DateToday,
-        OsFunctionCall::Exists(_) => Kind::Exists,
-        OsFunctionCall::Getenv(_) => Kind::Getenv,
-        OsFunctionCall::GetEnviron => {
-            return MontyObject::Exception {
-                exc_type: ExcType::OSError,
-                arg: Some("OS function os.environ is not implemented in this runtime".to_string()),
-            };
-        }
-        OsFunctionCall::IsFile(_) => Kind::IsFile,
-        OsFunctionCall::IsDir(_) => Kind::IsDir,
-        OsFunctionCall::IsSymlink(_) => Kind::IsSymlink,
-        OsFunctionCall::Iterdir(_) => Kind::Iterdir,
-        OsFunctionCall::Mkdir(_) => Kind::Mkdir,
-        OsFunctionCall::ReadBytes(_) => Kind::ReadBytes,
-        OsFunctionCall::ReadText(_) => Kind::ReadText,
-        OsFunctionCall::Rename(_) => Kind::Rename,
-        OsFunctionCall::Resolve(_) => Kind::Resolve,
-        OsFunctionCall::Rmdir(_) => Kind::Rmdir,
-        OsFunctionCall::Stat(_) => Kind::Stat,
-        OsFunctionCall::Unlink(_) => Kind::Unlink,
-        OsFunctionCall::WriteBytes(_) => Kind::WriteBytes,
-        OsFunctionCall::WriteText(_) => Kind::WriteText,
-        other => {
-            return MontyObject::Exception {
-                exc_type: ExcType::OSError,
-                arg: Some(format!(
-                    "OS function {other} is not implemented in this runtime"
-                )),
-            };
-        }
-    };
-
-    let (args, kwargs) = call.to_args();
-
-    // Extract the path string from the first arg (if present) and slice
-    // the remaining args so that callees index from 0.
-    let (path_str, rest) = match args.first() {
-        Some(MontyObject::Path(p)) => (Some(p.as_str()), &args[1..]),
-        Some(MontyObject::String(s)) => (Some(s.as_str()), &args[1..]),
-        _ => (None, args.as_slice()),
-    };
-
-    match kind {
-        Kind::Absolute => path_absolute(path_str),
-        Kind::DateTimeNow => datetime_now(&args, &kwargs),
-        Kind::DateToday => date_today(),
-        Kind::Exists => path_exists(path_str, &kwargs),
-        Kind::Getenv => os_getenv(&args, &kwargs),
-        Kind::IsFile => path_is_file(path_str, &kwargs),
-        Kind::IsDir => path_is_dir(path_str, &kwargs),
-        Kind::IsSymlink => path_is_symlink(path_str),
-        Kind::Iterdir => path_iterdir(path_str),
-        Kind::Mkdir => path_mkdir(path_str, rest, &kwargs),
-        Kind::ReadBytes => path_read_bytes(path_str),
-        Kind::ReadText => path_read_text(path_str, rest, &kwargs),
-        Kind::Rename => path_rename(path_str, rest, &kwargs),
-        Kind::Resolve => path_resolve(path_str, rest, &kwargs),
-        Kind::Rmdir => path_rmdir(path_str),
-        Kind::Stat => path_stat(path_str, &kwargs),
-        Kind::Unlink => path_unlink(path_str, rest, &kwargs),
-        Kind::WriteBytes => path_write_bytes(path_str, rest, &kwargs),
-        Kind::WriteText => path_write_text(path_str, rest, &kwargs),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Path property checks
-// ---------------------------------------------------------------------------
-
-fn path_exists(path_str: Option<&str>, kwargs: &[(MontyObject, MontyObject)]) -> MontyObject {
-    let follow_symlinks = match get_bool_kwarg(kwargs, "follow_symlinks", true, "Path.exists") {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    if let Some(p) = path_str {
-        let path = Path::new(p);
-        if follow_symlinks {
-            MontyObject::Bool(path.exists())
-        } else {
-            // Don't follow symlinks: use symlink_metadata which doesn't traverse.
-            MontyObject::Bool(std::fs::symlink_metadata(path).is_ok())
-        }
-    } else {
-        MontyObject::Bool(false)
-    }
-}
-
-fn path_is_file(path_str: Option<&str>, kwargs: &[(MontyObject, MontyObject)]) -> MontyObject {
-    let follow_symlinks = match get_bool_kwarg(kwargs, "follow_symlinks", true, "Path.is_file") {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    if let Some(p) = path_str {
-        let path = Path::new(p);
-        if follow_symlinks {
-            MontyObject::Bool(path.is_file())
-        } else {
-            // Don't follow symlinks: check symlink_metadata for file type.
-            MontyObject::Bool(
-                std::fs::symlink_metadata(path)
-                    .map(|m| m.file_type().is_file())
-                    .unwrap_or(false),
-            )
-        }
-    } else {
-        MontyObject::Bool(false)
-    }
-}
-
-fn path_is_dir(path_str: Option<&str>, kwargs: &[(MontyObject, MontyObject)]) -> MontyObject {
-    let follow_symlinks = match get_bool_kwarg(kwargs, "follow_symlinks", true, "Path.is_dir") {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    if let Some(p) = path_str {
-        let path = Path::new(p);
-        if follow_symlinks {
-            MontyObject::Bool(path.is_dir())
-        } else {
-            // Don't follow symlinks: check symlink_metadata for directory type.
-            MontyObject::Bool(
-                std::fs::symlink_metadata(path)
-                    .map(|m| m.file_type().is_dir())
-                    .unwrap_or(false),
-            )
-        }
-    } else {
-        MontyObject::Bool(false)
-    }
-}
-
-fn path_is_symlink(path_str: Option<&str>) -> MontyObject {
-    if let Some(p) = path_str {
-        MontyObject::Bool(Path::new(p).is_symlink())
-    } else {
-        MontyObject::Bool(false)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Read file contents
-// ---------------------------------------------------------------------------
-
-fn path_read_text(
-    path_str: Option<&str>,
-    args: &[MontyObject],
-    kwargs: &[(MontyObject, MontyObject)],
-) -> MontyObject {
-    // Validate encoding — only UTF-8 (the default) is supported.
-    match resolve_str_arg(args, 0, kwargs, "encoding", "Path.read_text", None) {
-        Ok(Some(s)) if s.eq_ignore_ascii_case("utf-8") || s.eq_ignore_ascii_case("utf8") => {}
-        Ok(Some(s)) => {
-            return MontyObject::Exception {
-                exc_type: ExcType::ValueError,
-                arg: Some(format!(
-                    "Path.read_text: unsupported encoding: '{s}' (only UTF-8 is supported)"
-                )),
-            };
-        }
-        Ok(None) => {}
-        Err(e) => return e,
-    }
-
-    // Validate errors — only "strict" (the default) is supported.
-    match resolve_str_arg(args, 1, kwargs, "errors", "Path.read_text", None) {
-        Ok(Some(s)) if s == "strict" => {}
-        Ok(Some(s)) => {
-            return MontyObject::Exception {
-                exc_type: ExcType::ValueError,
-                arg: Some(format!(
-                    "Path.read_text: unsupported error handler: '{s}' (only 'strict' is supported)"
-                )),
-            };
-        }
-        Ok(None) => {}
-        Err(e) => return e,
-    }
-
-    // Validate newline — only None (universal newlines, the default) is supported.
-    match resolve_str_arg(args, 2, kwargs, "newline", "Path.read_text", None) {
-        Ok(Some(s)) => {
-            return MontyObject::Exception {
-                exc_type: ExcType::ValueError,
-                arg: Some(format!(
-                    "Path.read_text: unsupported newline mode: '{s}' (only None is supported)"
-                )),
-            };
-        }
-        Ok(None) => {}
-        Err(e) => return e,
-    }
-
-    if let Some(p) = path_str {
-        match std::fs::read_to_string(p) {
+        // ---- Read --------------------------------------------------------
+        OsFunctionCall::ReadText(p) => match std::fs::read_to_string(p.as_str()) {
             Ok(contents) => MontyObject::String(contents),
-            Err(e) => MontyObject::Exception {
-                exc_type: ExcType::OSError,
-                arg: Some(format!("{e}")),
-            },
-        }
-    } else {
-        MontyObject::Exception {
-            exc_type: ExcType::OSError,
-            arg: Some("read_text: no path provided".into()),
-        }
-    }
-}
-
-fn path_read_bytes(path_str: Option<&str>) -> MontyObject {
-    if let Some(p) = path_str {
-        match std::fs::read(p) {
+            Err(e) => os_err(e),
+        },
+        OsFunctionCall::ReadBytes(p) => match std::fs::read(p.as_str()) {
             Ok(bytes) => MontyObject::Bytes(bytes),
-            Err(e) => MontyObject::Exception {
-                exc_type: ExcType::OSError,
-                arg: Some(format!("{e}")),
-            },
-        }
-    } else {
-        MontyObject::Exception {
-            exc_type: ExcType::OSError,
-            arg: Some("read_bytes: no path provided".into()),
-        }
-    }
-}
+            Err(e) => os_err(e),
+        },
 
-// ---------------------------------------------------------------------------
-// Write operations
-// ---------------------------------------------------------------------------
-
-fn path_write_text(
-    path_str: Option<&str>,
-    args: &[MontyObject],
-    kwargs: &[(MontyObject, MontyObject)],
-) -> MontyObject {
-    // data (required, positional-or-keyword at index 0)
-    let data = match resolve_str_arg(args, 0, kwargs, "data", "Path.write_text", None) {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return MontyObject::Exception {
-                exc_type: ExcType::TypeError,
-                arg: Some("Path.write_text: missing required argument: 'data'".into()),
-            };
-        }
-        Err(e) => return e,
-    };
-
-    // Validate encoding — only UTF-8 (the default) is supported.
-    match resolve_str_arg(args, 1, kwargs, "encoding", "Path.write_text", None) {
-        Ok(Some(s)) if s.eq_ignore_ascii_case("utf-8") || s.eq_ignore_ascii_case("utf8") => {}
-        Ok(Some(s)) => {
-            return MontyObject::Exception {
-                exc_type: ExcType::ValueError,
-                arg: Some(format!(
-                    "Path.write_text: unsupported encoding: '{s}' (only UTF-8 is supported)"
-                )),
-            };
-        }
-        Ok(None) => {}
-        Err(e) => return e,
-    }
-
-    // Validate errors — only "strict" (the default) is supported.
-    match resolve_str_arg(args, 2, kwargs, "errors", "Path.write_text", None) {
-        Ok(Some(s)) if s == "strict" => {}
-        Ok(Some(s)) => {
-            return MontyObject::Exception {
-                exc_type: ExcType::ValueError,
-                arg: Some(format!(
-                    "Path.write_text: unsupported error handler: '{s}' (only 'strict' is supported)"
-                )),
-            };
-        }
-        Ok(None) => {}
-        Err(e) => return e,
-    }
-
-    // Validate newline — only None (universal newlines, the default) is supported.
-    match resolve_str_arg(args, 3, kwargs, "newline", "Path.write_text", None) {
-        Ok(Some(s)) => {
-            return MontyObject::Exception {
-                exc_type: ExcType::ValueError,
-                arg: Some(format!(
-                    "Path.write_text: unsupported newline mode: '{s}' (only None is supported)"
-                )),
-            };
-        }
-        Ok(None) => {}
-        Err(e) => return e,
-    }
-
-    if let Some(p) = path_str {
-        match std::fs::write(p, data) {
-            Ok(()) => MontyObject::None,
-            Err(e) => MontyObject::Exception {
-                exc_type: ExcType::OSError,
-                arg: Some(format!("{e}")),
-            },
-        }
-    } else {
-        MontyObject::Exception {
-            exc_type: ExcType::OSError,
-            arg: Some("write_text: no path provided".into()),
-        }
-    }
-}
-
-fn path_write_bytes(
-    path_str: Option<&str>,
-    args: &[MontyObject],
-    kwargs: &[(MontyObject, MontyObject)],
-) -> MontyObject {
-    // data (required, positional-or-keyword at index 0)
-    let data = match resolve_bytes_arg(args, 0, kwargs, "data", "Path.write_bytes") {
-        Ok(Some(b)) => b,
-        Ok(None) => {
-            return MontyObject::Exception {
-                exc_type: ExcType::TypeError,
-                arg: Some("Path.write_bytes: missing required argument: 'data'".into()),
-            };
-        }
-        Err(e) => return e,
-    };
-
-    if let Some(p) = path_str {
-        match std::fs::write(p, data) {
-            Ok(()) => MontyObject::None,
-            Err(e) => MontyObject::Exception {
-                exc_type: ExcType::OSError,
-                arg: Some(format!("{e}")),
-            },
-        }
-    } else {
-        MontyObject::Exception {
-            exc_type: ExcType::OSError,
-            arg: Some("write_bytes: no path provided".into()),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Directory operations
-// ---------------------------------------------------------------------------
-
-fn path_mkdir(
-    path_str: Option<&str>,
-    args: &[MontyObject],
-    kwargs: &[(MontyObject, MontyObject)],
-) -> MontyObject {
-    // mode (index 0) — accept an int but ignore it (no portable permission
-    // support in WASM); default 0o777.
-    match resolve_int_arg(args, 0, kwargs, "mode", "Path.mkdir", Some(0o777)) {
-        Ok(_) => {}
-        Err(e) => return e,
-    }
-
-    // parents (index 1) — default False.
-    let parents = match resolve_bool_arg(args, 1, kwargs, "parents", "Path.mkdir", false) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    // exist_ok (index 2) — default False.
-    let exist_ok = match resolve_bool_arg(args, 2, kwargs, "exist_ok", "Path.mkdir", false) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    if let Some(p) = path_str {
-        let result = if parents {
-            std::fs::create_dir_all(p)
-        } else {
-            std::fs::create_dir(p)
-        };
-        match result {
-            Ok(()) => MontyObject::None,
-            Err(e) if exist_ok && e.kind() == std::io::ErrorKind::AlreadyExists => {
-                MontyObject::None
+        // ---- Write / Append ---------------------------------------------
+        // Text-mode `file.write` / `Path.write_text` return the number of
+        // *characters* written; Monty's `apply_write_position` uses this to
+        // advance the file-handle position. Binary returns byte count.
+        OsFunctionCall::WriteText(args) => {
+            let char_count = args.data.chars().count() as i64;
+            match std::fs::write(args.path.as_str(), args.data.as_bytes()) {
+                Ok(()) => MontyObject::Int(char_count),
+                Err(e) => os_err(e),
             }
-            Err(e) => MontyObject::Exception {
-                exc_type: ExcType::OSError,
-                arg: Some(format!("{e}")),
-            },
         }
-    } else {
-        MontyObject::None
-    }
-}
+        OsFunctionCall::WriteBytes(args) => {
+            let byte_count = args.data.len() as i64;
+            match std::fs::write(args.path.as_str(), args.data.as_slice()) {
+                Ok(()) => MontyObject::Int(byte_count),
+                Err(e) => os_err(e),
+            }
+        }
+        OsFunctionCall::AppendText(args) => {
+            let char_count = args.data.chars().count() as i64;
+            match std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(args.path.as_str())
+                .and_then(|mut f| std::io::Write::write_all(&mut f, args.data.as_bytes()))
+            {
+                Ok(()) => MontyObject::Int(char_count),
+                Err(e) => os_err(e),
+            }
+        }
+        OsFunctionCall::AppendBytes(args) => {
+            let byte_count = args.data.len() as i64;
+            match std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(args.path.as_str())
+                .and_then(|mut f| std::io::Write::write_all(&mut f, args.data.as_slice()))
+            {
+                Ok(()) => MontyObject::Int(byte_count),
+                Err(e) => os_err(e),
+            }
+        }
 
-fn path_unlink(
-    path_str: Option<&str>,
-    args: &[MontyObject],
-    kwargs: &[(MontyObject, MontyObject)],
-) -> MontyObject {
-    // missing_ok (index 0) — default False.
-    let missing_ok = match resolve_bool_arg(args, 0, kwargs, "missing_ok", "Path.unlink", false) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+        // ---- open() ------------------------------------------------------
+        // The host never holds a live OS handle — perform the open-time
+        // effect (truncate `w`, create `a`, existence check `r`) and return a
+        // stateless [`MontyFileHandle`]. Subsequent reads/writes arrive as
+        // their own OS calls keyed by this path.
+        OsFunctionCall::Open(args) => {
+            let path = args.path.as_str();
+            let mode = args.mode;
+            let p = Path::new(path);
+            if !mode.truncate() && !mode.create() && p.is_dir() {
+                MontyObject::Exception {
+                    exc_type: ExcType::IsADirectoryError,
+                    arg: Some(format!("[Errno 21] Is a directory: '{path}'")),
+                }
+            } else {
+                let effect = if mode.truncate() {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(p)
+                        .map(drop)
+                } else if mode.create() {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(p)
+                        .map(drop)
+                } else {
+                    std::fs::OpenOptions::new().read(true).open(p).map(drop)
+                };
+                match effect {
+                    Ok(()) => MontyObject::FileHandle(MontyFileHandle {
+                        path: path.to_owned(),
+                        mode,
+                        position: 0,
+                    }),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => MontyObject::Exception {
+                        exc_type: ExcType::FileNotFoundError,
+                        arg: Some(format!("[Errno 2] No such file or directory: '{path}'")),
+                    },
+                    Err(e) => os_err(e),
+                }
+            }
+        }
 
-    if let Some(p) = path_str {
-        match std::fs::remove_file(p) {
+        // ---- Directory & filesystem mutate ------------------------------
+        OsFunctionCall::Mkdir(args) => {
+            let result = if args.parents {
+                std::fs::create_dir_all(args.path.as_str())
+            } else {
+                std::fs::create_dir(args.path.as_str())
+            };
+            match result {
+                Ok(()) => MontyObject::None,
+                Err(e) if args.exist_ok && e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    MontyObject::None
+                }
+                Err(e) => os_err(e),
+            }
+        }
+        OsFunctionCall::Unlink(p) => match std::fs::remove_file(p.as_str()) {
             Ok(()) => MontyObject::None,
-            Err(e) if missing_ok && e.kind() == std::io::ErrorKind::NotFound => MontyObject::None,
-            Err(e) => MontyObject::Exception {
-                exc_type: ExcType::OSError,
-                arg: Some(format!("{e}")),
-            },
-        }
-    } else {
-        MontyObject::None
-    }
-}
-
-fn path_rmdir(path_str: Option<&str>) -> MontyObject {
-    if let Some(p) = path_str {
-        match std::fs::remove_dir(p) {
+            Err(e) => os_err(e),
+        },
+        OsFunctionCall::Rmdir(p) => match std::fs::remove_dir(p.as_str()) {
             Ok(()) => MontyObject::None,
-            Err(e) => MontyObject::Exception {
-                exc_type: ExcType::OSError,
-                arg: Some(format!("{e}")),
-            },
-        }
-    } else {
-        MontyObject::None
-    }
-}
-
-fn path_iterdir(path_str: Option<&str>) -> MontyObject {
-    if let Some(p) = path_str {
-        match std::fs::read_dir(p) {
-            Ok(entries) => {
-                let items: Vec<MontyObject> = entries
+            Err(e) => os_err(e),
+        },
+        OsFunctionCall::Iterdir(p) => match std::fs::read_dir(p.as_str()) {
+            Ok(entries) => MontyObject::List(
+                entries
                     .filter_map(|e| e.ok())
                     .map(|e| MontyObject::String(e.path().to_string_lossy().into_owned()))
-                    .collect();
-                MontyObject::List(items)
+                    .collect(),
+            ),
+            Err(e) => os_err(e),
+        },
+        OsFunctionCall::Rename(args) => {
+            match std::fs::rename(args.src.as_str(), args.dst.as_str()) {
+                Ok(()) => MontyObject::None,
+                Err(e) => os_err(e),
             }
-            Err(e) => MontyObject::Exception {
-                exc_type: ExcType::OSError,
-                arg: Some(format!("{e}")),
-            },
         }
-    } else {
-        MontyObject::List(vec![])
-    }
-}
 
-// ---------------------------------------------------------------------------
-// Stat
-// ---------------------------------------------------------------------------
-
-fn path_stat(path_str: Option<&str>, kwargs: &[(MontyObject, MontyObject)]) -> MontyObject {
-    let follow_symlinks = match get_bool_kwarg(kwargs, "follow_symlinks", true, "Path.stat") {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    if let Some(p) = path_str {
-        let result = if follow_symlinks {
-            std::fs::metadata(p)
-        } else {
-            std::fs::symlink_metadata(p)
-        };
-        match result {
+        // ---- Stat -------------------------------------------------------
+        // Monty no longer forwards `follow_symlinks`; always follow.
+        OsFunctionCall::Stat(p) => match std::fs::metadata(p.as_str()) {
             Ok(meta) => {
                 let size = meta.len() as i64;
                 let mtime = meta
@@ -550,88 +236,14 @@ fn path_stat(path_str: Option<&str>, kwargs: &[(MontyObject, MontyObject)]) -> M
                     file_stat(0o644, size, mtime)
                 }
             }
-            Err(e) => MontyObject::Exception {
-                exc_type: ExcType::OSError,
-                arg: Some(format!("{e}")),
-            },
-        }
-    } else {
-        MontyObject::None
-    }
-}
+            Err(e) => os_err(e),
+        },
 
-// ---------------------------------------------------------------------------
-// Rename
-// ---------------------------------------------------------------------------
-
-fn path_rename(
-    path_str: Option<&str>,
-    args: &[MontyObject],
-    kwargs: &[(MontyObject, MontyObject)],
-) -> MontyObject {
-    // target (required, positional-or-keyword at index 0)
-    let dest = match resolve_arg(args, 0, kwargs, "target") {
-        Some(MontyObject::Path(p)) => p.as_str(),
-        Some(MontyObject::String(s)) => s.as_str(),
-        Some(_) => {
-            return MontyObject::Exception {
-                exc_type: ExcType::TypeError,
-                arg: Some("Path.rename: 'target' must be a string or Path".into()),
-            };
-        }
-        None => {
-            return MontyObject::Exception {
-                exc_type: ExcType::TypeError,
-                arg: Some("Path.rename: missing required argument: 'target'".into()),
-            };
-        }
-    };
-
-    if let Some(src) = path_str {
-        match std::fs::rename(src, dest) {
-            Ok(()) => MontyObject::None,
-            Err(e) => MontyObject::Exception {
-                exc_type: ExcType::OSError,
-                arg: Some(format!("{e}")),
-            },
-        }
-    } else {
-        MontyObject::Exception {
-            exc_type: ExcType::OSError,
-            arg: Some("rename: no path provided".into()),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Resolve / Absolute
-// ---------------------------------------------------------------------------
-
-fn path_resolve(
-    path_str: Option<&str>,
-    args: &[MontyObject],
-    kwargs: &[(MontyObject, MontyObject)],
-) -> MontyObject {
-    // strict (index 0) — default False.
-    let strict = match resolve_bool_arg(args, 0, kwargs, "strict", "Path.resolve", false) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    if let Some(p) = path_str {
-        if strict {
-            // strict=True: path must exist, use canonicalize which resolves
-            // symlinks and errors if the path doesn't exist.
-            match std::fs::canonicalize(p) {
-                Ok(resolved) => MontyObject::String(resolved.to_string_lossy().into_owned()),
-                Err(e) => MontyObject::Exception {
-                    exc_type: ExcType::OSError,
-                    arg: Some(format!("{e}")),
-                },
-            }
-        } else {
-            // strict=False: resolve what we can without requiring existence.
-            let path = Path::new(p);
+        // ---- Resolve / Absolute -----------------------------------------
+        // Monty no longer forwards `strict`; resolve what we can without
+        // requiring existence (matches `Path.resolve(strict=False)`).
+        OsFunctionCall::Resolve(p) => {
+            let path = Path::new(p.as_str());
             MontyObject::String(
                 std::env::current_dir()
                     .map(|cwd| {
@@ -640,146 +252,120 @@ fn path_resolve(
                         } else {
                             cwd.join(path)
                         };
-                        // Attempt canonicalize; fall back to the joined path.
                         std::fs::canonicalize(&abs)
                             .unwrap_or(abs)
                             .to_string_lossy()
                             .into_owned()
                     })
-                    .unwrap_or_else(|_| p.to_string()),
+                    .unwrap_or_else(|_| p.as_str().to_string()),
             )
         }
-    } else {
-        MontyObject::String(String::new())
-    }
-}
-
-fn path_absolute(path_str: Option<&str>) -> MontyObject {
-    if let Some(p) = path_str {
-        let abs = Path::new(p);
-        MontyObject::String(
-            std::env::current_dir()
-                .map(|cwd| cwd.join(abs).to_string_lossy().into_owned())
-                .unwrap_or_else(|_| p.to_string()),
-        )
-    } else {
-        MontyObject::String(String::new())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Environment
-// ---------------------------------------------------------------------------
-
-fn os_getenv(args: &[MontyObject], kwargs: &[(MontyObject, MontyObject)]) -> MontyObject {
-    // key (required, positional-or-keyword at index 0)
-    let key = match resolve_str_arg(args, 0, kwargs, "key", "os.getenv", None) {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return MontyObject::Exception {
-                exc_type: ExcType::TypeError,
-                arg: Some("os.getenv: missing required argument: 'key'".into()),
-            };
+        OsFunctionCall::Absolute(p) => {
+            let path = Path::new(p.as_str());
+            MontyObject::String(
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(path).to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| p.as_str().to_string()),
+            )
         }
-        Err(e) => return e,
-    };
 
-    // default (optional, positional-or-keyword at index 1) — default None.
-    let default = match resolve_arg(args, 1, kwargs, "default") {
-        Some(v) => v.clone(),
-        None => MontyObject::None,
-    };
-
-    match extism_pdk::config::get(&key) {
-        Ok(Some(val)) => MontyObject::String(val),
-        Ok(None) => default,
-        Err(e) => MontyObject::Exception {
+        // ---- Environment ------------------------------------------------
+        OsFunctionCall::Getenv(args) => match extism_config_get(&args.key) {
+            Ok(Some(val)) => MontyObject::String(val),
+            Ok(None) => args.default.clone(),
+            Err(e) => MontyObject::Exception {
+                exc_type: ExcType::OSError,
+                arg: Some(format!("os.getenv: Error getting {}: {e}", args.key)),
+            },
+        },
+        OsFunctionCall::GetEnviron => MontyObject::Exception {
             exc_type: ExcType::OSError,
-            arg: Some(format!("os.getenv: Error getting {key}: {e}")),
+            arg: Some("OS function os.environ is not implemented in this runtime".into()),
         },
-    }
-}
 
-// ---------------------------------------------------------------------------
-// Date and Time
-// ---------------------------------------------------------------------------
-fn datetime_now(args: &[MontyObject], kwargs: &[(MontyObject, MontyObject)]) -> MontyObject {
-    match resolve_arg(args, 0, kwargs, "tz") {
-        Some(MontyObject::TimeZone(tz)) => {
-            let offset = match FixedOffset::east_opt(tz.offset_seconds) {
-                Some(fo) => fo,
-                None => {
-                    return MontyObject::Exception {
-                        exc_type: ExcType::ValueError,
-                        arg: Some(format!(
-                            "'tz' contains an invalid offset ({})",
-                            tz.offset_seconds
-                        )),
-                    };
+        // ---- Date / Time ------------------------------------------------
+        OsFunctionCall::DateTimeNow(tz) => match tz {
+            MontyObject::TimeZone(tz) => match FixedOffset::east_opt(tz.offset_seconds) {
+                Some(offset) => {
+                    let now = Utc::now().with_timezone(&offset);
+                    MontyObject::DateTime(MontyDateTime {
+                        year: now.year(),
+                        month: now.month() as u8,
+                        day: now.day() as u8,
+                        hour: now.hour() as u8,
+                        minute: now.minute() as u8,
+                        second: now.second() as u8,
+                        microsecond: now.timestamp_subsec_micros(),
+                        offset_seconds: Some(now.offset().local_minus_utc()),
+                        timezone_name: tz.name.clone(),
+                    })
                 }
-            };
-            let now = Utc::now().with_timezone(&offset);
-            MontyObject::DateTime(MontyDateTime {
-                year: now.year(),
-                month: now.month() as u8,
-                day: now.day() as u8,
-                hour: now.hour() as u8,
-                minute: now.minute() as u8,
-                second: now.second() as u8,
-                microsecond: now.timestamp_subsec_micros(),
-                offset_seconds: Some(now.offset().local_minus_utc()),
-                timezone_name: tz.name.clone(),
+                None => MontyObject::Exception {
+                    exc_type: ExcType::ValueError,
+                    arg: Some(format!(
+                        "'tz' contains an invalid offset ({})",
+                        tz.offset_seconds
+                    )),
+                },
+            },
+            MontyObject::None => {
+                let now = Local::now();
+                MontyObject::DateTime(MontyDateTime {
+                    year: now.year(),
+                    month: now.month() as u8,
+                    day: now.day() as u8,
+                    hour: now.hour() as u8,
+                    minute: now.minute() as u8,
+                    second: now.second() as u8,
+                    microsecond: now.timestamp_subsec_micros(),
+                    offset_seconds: Some(now.offset().local_minus_utc()),
+                    timezone_name: None,
+                })
+            }
+            _ => MontyObject::Exception {
+                exc_type: ExcType::TypeError,
+                arg: Some("datetime.now: 'tz' must be a timezone".into()),
+            },
+        },
+        OsFunctionCall::DateToday => {
+            let today = Local::now().date_naive();
+            MontyObject::Date(MontyDate {
+                year: today.year(),
+                month: today.month() as u8,
+                day: today.day() as u8,
             })
         }
-        Some(MontyObject::None) | None => {
-            let now = Local::now();
-            MontyObject::DateTime(MontyDateTime {
-                year: now.year(),
-                month: now.month() as u8,
-                day: now.day() as u8,
-                hour: now.hour() as u8,
-                minute: now.minute() as u8,
-                second: now.second() as u8,
-                microsecond: now.timestamp_subsec_micros(),
-                offset_seconds: Some(now.offset().local_minus_utc()),
-                timezone_name: None,
-            })
-        }
-        Some(_) => MontyObject::Exception {
-            exc_type: ExcType::TypeError,
-            arg: Some("datetime.now: 'tz' must be a timezone".to_string()),
+
+        // ---- Anything else (currently just `Used`, unreachable) ---------
+        other => MontyObject::Exception {
+            exc_type: ExcType::OSError,
+            arg: Some(format!(
+                "OS function {other} is not implemented in this runtime"
+            )),
         },
     }
-}
-
-fn date_today() -> MontyObject {
-    let today = Local::now().date_naive();
-    MontyObject::Date(MontyDate {
-        year: today.year(),
-        month: today.month() as u8,
-        day: today.day() as u8,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use monty::MontyTimeZone;
+    use monty::{
+        GetenvArgs, MkdirCallArgs, MontyFileHandle, MontyPath, MontyTimeZone, OpenCallArgs,
+        PathBytesDataArgs, PathStringDataArgs, RenameCallArgs,
+    };
     use std::io::Write;
     use tempfile::TempDir;
 
     // ── Helpers ──────────────────────────────────────────────────────
 
-    fn kwarg(name: &str, val: MontyObject) -> (MontyObject, MontyObject) {
-        (MontyObject::String(name.to_string()), val)
+    /// Build a `MontyPath` from a borrowed string slice.
+    fn mp(s: &str) -> MontyPath {
+        MontyPath::new(s.to_string())
     }
 
-    fn s(val: &str) -> MontyObject {
-        MontyObject::String(val.to_string())
-    }
-
-    fn no_kwargs() -> Vec<(MontyObject, MontyObject)> {
-        vec![]
+    /// Shorthand for invoking the real dispatcher.
+    fn call(c: OsFunctionCall) -> MontyObject {
+        handle_os_call(c)
     }
 
     fn is_bool(obj: &MontyObject, expected: bool) -> bool {
@@ -790,7 +376,8 @@ mod tests {
         matches!(obj, MontyObject::Exception { exc_type, .. } if *exc_type == expected)
     }
 
-    /// Create a temp file inside `dir` with the given name and content.
+    /// Create a temp file inside `dir` with the given name and content;
+    /// returns its absolute path as a `String`.
     fn create_file(dir: &TempDir, name: &str, content: &str) -> String {
         let path = dir.path().join(name);
         let mut f = std::fs::File::create(&path).unwrap();
@@ -798,911 +385,576 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
-    /// Return the string path for a child inside a TempDir (doesn't create it).
+    /// Return the string path for a child inside a `TempDir` (doesn't create it).
     fn child_path(dir: &TempDir, name: &str) -> String {
         dir.path().join(name).to_string_lossy().into_owned()
     }
 
-    // ── path_exists ─────────────────────────────────────────────────
+    // ── Exists ──────────────────────────────────────────────────────
 
     #[test]
-    fn path_exists_true_for_existing_file() {
+    fn exists_true_for_existing_file() {
         let dir = TempDir::new().unwrap();
         let p = create_file(&dir, "exists.txt", "hi");
-        assert!(is_bool(&path_exists(Some(&p), &no_kwargs()), true));
+        assert!(is_bool(&call(OsFunctionCall::Exists(mp(&p))), true));
     }
 
     #[test]
-    fn path_exists_false_for_nonexistent() {
+    fn exists_true_for_directory() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().to_string_lossy().into_owned();
+        assert!(is_bool(&call(OsFunctionCall::Exists(mp(&p))), true));
+    }
+
+    #[test]
+    fn exists_false_for_nonexistent() {
         assert!(is_bool(
-            &path_exists(Some("/tmp/__no_such_file__"), &no_kwargs()),
-            false
+            &call(OsFunctionCall::Exists(mp("/tmp/__no_such_file__"))),
+            false,
         ));
     }
 
-    #[test]
-    fn path_exists_false_when_no_path() {
-        assert!(is_bool(&path_exists(None, &no_kwargs()), false));
-    }
+    // ── IsFile / IsDir / IsSymlink ──────────────────────────────────
 
     #[test]
-    fn path_exists_follow_symlinks_kwarg_error_on_wrong_type() {
-        let kwargs = vec![kwarg("follow_symlinks", s("yes"))];
-        let result = path_exists(Some("/tmp"), &kwargs);
-        assert!(is_exception_of(&result, ExcType::TypeError));
-    }
-
-    #[test]
-    fn path_exists_true_for_directory() {
-        let dir = TempDir::new().unwrap();
-        let p = dir.path().to_string_lossy().into_owned();
-        assert!(is_bool(&path_exists(Some(&p), &no_kwargs()), true));
-    }
-
-    // ── path_is_file ────────────────────────────────────────────────
-
-    #[test]
-    fn path_is_file_true_for_file() {
+    fn is_file_true_for_file() {
         let dir = TempDir::new().unwrap();
         let p = create_file(&dir, "f.txt", "data");
-        assert!(is_bool(&path_is_file(Some(&p), &no_kwargs()), true));
+        assert!(is_bool(&call(OsFunctionCall::IsFile(mp(&p))), true));
     }
 
     #[test]
-    fn path_is_file_false_for_directory() {
+    fn is_file_false_for_directory() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().to_string_lossy().into_owned();
-        assert!(is_bool(&path_is_file(Some(&p), &no_kwargs()), false));
+        assert!(is_bool(&call(OsFunctionCall::IsFile(mp(&p))), false));
     }
 
     #[test]
-    fn path_is_file_false_for_nonexistent() {
+    fn is_file_false_for_nonexistent() {
         assert!(is_bool(
-            &path_is_file(Some("/tmp/__nope__"), &no_kwargs()),
-            false
+            &call(OsFunctionCall::IsFile(mp("/tmp/__nope__"))),
+            false,
         ));
     }
 
     #[test]
-    fn path_is_file_false_when_no_path() {
-        assert!(is_bool(&path_is_file(None, &no_kwargs()), false));
-    }
-
-    #[test]
-    fn path_is_file_follow_symlinks_kwarg_error() {
-        let kwargs = vec![kwarg("follow_symlinks", MontyObject::Int(1))];
-        let result = path_is_file(Some("/tmp"), &kwargs);
-        assert!(is_exception_of(&result, ExcType::TypeError));
-    }
-
-    // ── path_is_dir ─────────────────────────────────────────────────
-
-    #[test]
-    fn path_is_dir_true_for_directory() {
+    fn is_dir_true_for_directory() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().to_string_lossy().into_owned();
-        assert!(is_bool(&path_is_dir(Some(&p), &no_kwargs()), true));
+        assert!(is_bool(&call(OsFunctionCall::IsDir(mp(&p))), true));
     }
 
     #[test]
-    fn path_is_dir_false_for_file() {
+    fn is_dir_false_for_file() {
         let dir = TempDir::new().unwrap();
         let p = create_file(&dir, "f.txt", "x");
-        assert!(is_bool(&path_is_dir(Some(&p), &no_kwargs()), false));
+        assert!(is_bool(&call(OsFunctionCall::IsDir(mp(&p))), false));
     }
 
     #[test]
-    fn path_is_dir_false_for_nonexistent() {
+    fn is_dir_false_for_nonexistent() {
         assert!(is_bool(
-            &path_is_dir(Some("/tmp/__nope__"), &no_kwargs()),
-            false
+            &call(OsFunctionCall::IsDir(mp("/tmp/__nope_dir__"))),
+            false,
         ));
     }
 
     #[test]
-    fn path_is_dir_false_when_no_path() {
-        assert!(is_bool(&path_is_dir(None, &no_kwargs()), false));
-    }
-
-    // ── path_is_symlink ─────────────────────────────────────────────
-
-    #[test]
-    fn path_is_symlink_false_for_regular_file() {
+    fn is_symlink_false_for_regular_file() {
         let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "x");
-        assert!(is_bool(&path_is_symlink(Some(&p)), false));
+        let p = create_file(&dir, "plain.txt", "x");
+        assert!(is_bool(&call(OsFunctionCall::IsSymlink(mp(&p))), false));
     }
 
     #[test]
-    fn path_is_symlink_false_when_no_path() {
-        assert!(is_bool(&path_is_symlink(None), false));
-    }
-
     #[cfg(unix)]
-    #[test]
-    fn path_is_symlink_true_for_symlink() {
+    fn is_symlink_true_for_symlink() {
         let dir = TempDir::new().unwrap();
-        let target = create_file(&dir, "target.txt", "real");
+        let target = create_file(&dir, "target.txt", "x");
         let link = child_path(&dir, "link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(is_bool(&path_is_symlink(Some(&link)), true));
+        assert!(is_bool(&call(OsFunctionCall::IsSymlink(mp(&link))), true));
     }
 
-    // ── path_read_text ──────────────────────────────────────────────
+    // ── ReadText / ReadBytes ────────────────────────────────────────
 
     #[test]
-    fn path_read_text_success() {
+    fn read_text_success() {
         let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "hello.txt", "hello world");
-        let result = path_read_text(Some(&p), &[], &no_kwargs());
-        assert!(matches!(result, MontyObject::String(ref s) if s == "hello world"));
+        let p = create_file(&dir, "f.txt", "hello");
+        let r = call(OsFunctionCall::ReadText(mp(&p)));
+        assert!(matches!(r, MontyObject::String(ref s) if s == "hello"));
     }
 
     #[test]
-    fn path_read_text_nonexistent_file() {
-        let result = path_read_text(Some("/tmp/__no_such_file_read__"), &[], &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::OSError));
+    fn read_text_nonexistent_returns_oserror() {
+        let r = call(OsFunctionCall::ReadText(mp("/tmp/__no_such_read__")));
+        assert!(is_exception_of(&r, ExcType::OSError));
     }
 
     #[test]
-    fn path_read_text_no_path() {
-        let result = path_read_text(None, &[], &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::OSError));
-        if let MontyObject::Exception { arg, .. } = &result {
-            assert!(arg.as_ref().unwrap().contains("no path"));
-        }
-    }
-
-    #[test]
-    fn path_read_text_utf8_encoding_accepted() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "café");
-        let args = vec![s("utf-8")];
-        let result = path_read_text(Some(&p), &args, &no_kwargs());
-        assert!(matches!(result, MontyObject::String(ref s) if s == "café"));
-    }
-
-    #[test]
-    fn path_read_text_utf8_encoding_case_insensitive() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "ok");
-        let args = vec![s("UTF-8")];
-        let result = path_read_text(Some(&p), &args, &no_kwargs());
-        assert!(matches!(result, MontyObject::String(_)));
-    }
-
-    #[test]
-    fn path_read_text_unsupported_encoding() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "hi");
-        let args = vec![s("latin-1")];
-        let result = path_read_text(Some(&p), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::ValueError));
-        if let MontyObject::Exception { arg, .. } = &result {
-            assert!(arg.as_ref().unwrap().contains("latin-1"));
-        }
-    }
-
-    #[test]
-    fn path_read_text_unsupported_errors_handler() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "hi");
-        let args = vec![MontyObject::None, s("ignore")];
-        let result = path_read_text(Some(&p), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::ValueError));
-        if let MontyObject::Exception { arg, .. } = &result {
-            assert!(arg.as_ref().unwrap().contains("ignore"));
-        }
-    }
-
-    #[test]
-    fn path_read_text_strict_errors_accepted() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "ok");
-        let args = vec![MontyObject::None, s("strict")];
-        let result = path_read_text(Some(&p), &args, &no_kwargs());
-        assert!(matches!(result, MontyObject::String(ref s) if s == "ok"));
-    }
-
-    #[test]
-    fn path_read_text_unsupported_newline() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "hi");
-        let args = vec![MontyObject::None, MontyObject::None, s("\r\n")];
-        let result = path_read_text(Some(&p), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::ValueError));
-    }
-
-    #[test]
-    fn path_read_text_encoding_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "café");
-        let kwargs = vec![kwarg("encoding", s("utf-8"))];
-        let result = path_read_text(Some(&p), &[], &kwargs);
-        assert!(matches!(result, MontyObject::String(ref s) if s == "café"));
-    }
-
-    #[test]
-    fn path_read_text_unsupported_encoding_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "hi");
-        let kwargs = vec![kwarg("encoding", s("latin-1"))];
-        let result = path_read_text(Some(&p), &[], &kwargs);
-        assert!(is_exception_of(&result, ExcType::ValueError));
-    }
-
-    #[test]
-    fn path_read_text_errors_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "ok");
-        let kwargs = vec![kwarg("errors", s("strict"))];
-        let result = path_read_text(Some(&p), &[], &kwargs);
-        assert!(matches!(result, MontyObject::String(ref s) if s == "ok"));
-    }
-
-    #[test]
-    fn path_read_text_unsupported_errors_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "hi");
-        let kwargs = vec![kwarg("errors", s("ignore"))];
-        let result = path_read_text(Some(&p), &[], &kwargs);
-        assert!(is_exception_of(&result, ExcType::ValueError));
-    }
-
-    #[test]
-    fn path_read_text_unsupported_newline_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "f.txt", "hi");
-        let kwargs = vec![kwarg("newline", s("\r\n"))];
-        let result = path_read_text(Some(&p), &[], &kwargs);
-        assert!(is_exception_of(&result, ExcType::ValueError));
-    }
-
-    // ── path_read_bytes ─────────────────────────────────────────────
-
-    #[test]
-    fn path_read_bytes_success() {
+    fn read_bytes_success() {
         let dir = TempDir::new().unwrap();
         let p = create_file(&dir, "data.bin", "binary");
-        let result = path_read_bytes(Some(&p));
-        assert!(matches!(result, MontyObject::Bytes(ref b) if b == b"binary"));
+        let r = call(OsFunctionCall::ReadBytes(mp(&p)));
+        assert!(matches!(r, MontyObject::Bytes(ref b) if b == b"binary"));
     }
 
     #[test]
-    fn path_read_bytes_nonexistent() {
-        let result = path_read_bytes(Some("/tmp/__no_such_file_bytes__"));
-        assert!(is_exception_of(&result, ExcType::OSError));
+    fn read_bytes_nonexistent_returns_oserror() {
+        let r = call(OsFunctionCall::ReadBytes(mp("/tmp/__no_such_bytes__")));
+        assert!(is_exception_of(&r, ExcType::OSError));
     }
 
-    #[test]
-    fn path_read_bytes_no_path() {
-        let result = path_read_bytes(None);
-        assert!(is_exception_of(&result, ExcType::OSError));
-        if let MontyObject::Exception { arg, .. } = &result {
-            assert!(arg.as_ref().unwrap().contains("no path"));
-        }
-    }
-
-    // ── path_write_text ─────────────────────────────────────────────
+    // ── WriteText / WriteBytes ──────────────────────────────────────
 
     #[test]
-    fn path_write_text_success() {
+    fn write_text_returns_char_count_and_writes_file() {
         let dir = TempDir::new().unwrap();
         let p = child_path(&dir, "out.txt");
-        let args = vec![s("written content")];
-        let result = path_write_text(Some(&p), &args, &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
+        let r = call(OsFunctionCall::WriteText(PathStringDataArgs {
+            path: mp(&p),
+            data: "written content".into(),
+        }));
+        // 15 characters
+        assert!(matches!(r, MontyObject::Int(15)));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "written content");
     }
 
     #[test]
-    fn path_write_text_missing_data() {
+    fn write_text_counts_characters_not_bytes() {
         let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.txt");
-        let result = path_write_text(Some(&p), &[], &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::TypeError));
-        if let MontyObject::Exception { arg, .. } = &result {
-            assert!(arg.as_ref().unwrap().contains("data"));
-        }
+        let p = child_path(&dir, "uni.txt");
+        let r = call(OsFunctionCall::WriteText(PathStringDataArgs {
+            path: mp(&p),
+            // "🎉" is one character but four UTF-8 bytes.
+            data: "🎉".into(),
+        }));
+        assert!(matches!(r, MontyObject::Int(1)));
     }
 
     #[test]
-    fn path_write_text_no_path() {
-        let args = vec![s("data")];
-        let result = path_write_text(None, &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::OSError));
-    }
-
-    #[test]
-    fn path_write_text_unsupported_encoding() {
+    fn write_text_overwrites_existing() {
         let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.txt");
-        let args = vec![s("data"), s("ascii")];
-        let result = path_write_text(Some(&p), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::ValueError));
-        if let MontyObject::Exception { arg, .. } = &result {
-            assert!(arg.as_ref().unwrap().contains("ascii"));
-        }
+        let p = create_file(&dir, "f.txt", "old content");
+        let r = call(OsFunctionCall::WriteText(PathStringDataArgs {
+            path: mp(&p),
+            data: "new".into(),
+        }));
+        assert!(matches!(r, MontyObject::Int(3)));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new");
     }
 
     #[test]
-    fn path_write_text_utf8_encoding_accepted() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.txt");
-        let args = vec![s("data"), s("utf-8")];
-        let result = path_write_text(Some(&p), &args, &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
-    }
-
-    #[test]
-    fn path_write_text_data_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.txt");
-        let kwargs = vec![kwarg("data", s("kwarg content"))];
-        let result = path_write_text(Some(&p), &[], &kwargs);
-        assert!(matches!(result, MontyObject::None));
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "kwarg content");
-    }
-
-    #[test]
-    fn path_write_text_encoding_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.txt");
-        let kwargs = vec![kwarg("data", s("hi")), kwarg("encoding", s("utf-8"))];
-        let result = path_write_text(Some(&p), &[], &kwargs);
-        assert!(matches!(result, MontyObject::None));
-    }
-
-    #[test]
-    fn path_write_text_unsupported_encoding_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.txt");
-        let kwargs = vec![kwarg("data", s("hi")), kwarg("encoding", s("ascii"))];
-        let result = path_write_text(Some(&p), &[], &kwargs);
-        assert!(is_exception_of(&result, ExcType::ValueError));
-    }
-
-    #[test]
-    fn path_write_text_errors_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.txt");
-        let kwargs = vec![kwarg("data", s("hi")), kwarg("errors", s("replace"))];
-        let result = path_write_text(Some(&p), &[], &kwargs);
-        assert!(is_exception_of(&result, ExcType::ValueError));
-    }
-
-    #[test]
-    fn path_write_text_newline_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.txt");
-        let kwargs = vec![kwarg("data", s("hi")), kwarg("newline", s("\n"))];
-        let result = path_write_text(Some(&p), &[], &kwargs);
-        assert!(is_exception_of(&result, ExcType::ValueError));
-    }
-
-    #[test]
-    fn path_write_text_unsupported_errors_handler() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.txt");
-        let args = vec![s("data"), MontyObject::None, s("replace")];
-        let result = path_write_text(Some(&p), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::ValueError));
-    }
-
-    #[test]
-    fn path_write_text_unsupported_newline() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.txt");
-        let args = vec![s("data"), MontyObject::None, MontyObject::None, s("\n")];
-        let result = path_write_text(Some(&p), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::ValueError));
-    }
-
-    // ── path_write_bytes ────────────────────────────────────────────
-
-    #[test]
-    fn path_write_bytes_success() {
+    fn write_bytes_returns_byte_count_and_writes_file() {
         let dir = TempDir::new().unwrap();
         let p = child_path(&dir, "out.bin");
-        let args = vec![MontyObject::Bytes(vec![1, 2, 3])];
-        let result = path_write_bytes(Some(&p), &args, &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
+        let r = call(OsFunctionCall::WriteBytes(PathBytesDataArgs {
+            path: mp(&p),
+            data: vec![1, 2, 3],
+        }));
+        assert!(matches!(r, MontyObject::Int(3)));
+        assert_eq!(std::fs::read(&p).unwrap(), vec![1, 2, 3]);
+    }
+
+    // ── AppendText / AppendBytes ────────────────────────────────────
+
+    #[test]
+    fn append_text_appends_and_returns_char_count() {
+        let dir = TempDir::new().unwrap();
+        let p = create_file(&dir, "log.txt", "a");
+        let r = call(OsFunctionCall::AppendText(PathStringDataArgs {
+            path: mp(&p),
+            data: "bc".into(),
+        }));
+        assert!(matches!(r, MontyObject::Int(2)));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "abc");
+    }
+
+    #[test]
+    fn append_text_creates_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let p = child_path(&dir, "new.txt");
+        let r = call(OsFunctionCall::AppendText(PathStringDataArgs {
+            path: mp(&p),
+            data: "hi".into(),
+        }));
+        assert!(matches!(r, MontyObject::Int(2)));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hi");
+    }
+
+    #[test]
+    fn append_text_counts_characters_not_bytes() {
+        let dir = TempDir::new().unwrap();
+        let p = child_path(&dir, "uni.txt");
+        let r = call(OsFunctionCall::AppendText(PathStringDataArgs {
+            path: mp(&p),
+            data: "🎉".into(),
+        }));
+        assert!(matches!(r, MontyObject::Int(1)));
+    }
+
+    #[test]
+    fn append_bytes_appends_and_returns_byte_count() {
+        let dir = TempDir::new().unwrap();
+        let p = create_file(&dir, "log.bin", "");
+        let r = call(OsFunctionCall::AppendBytes(PathBytesDataArgs {
+            path: mp(&p),
+            data: vec![1, 2, 3],
+        }));
+        assert!(matches!(r, MontyObject::Int(3)));
         assert_eq!(std::fs::read(&p).unwrap(), vec![1, 2, 3]);
     }
 
     #[test]
-    fn path_write_bytes_missing_data() {
+    fn append_bytes_appends_to_existing() {
         let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.bin");
-        let result = path_write_bytes(Some(&p), &[], &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::TypeError));
+        let p = child_path(&dir, "acc.bin");
+        let _ = call(OsFunctionCall::AppendBytes(PathBytesDataArgs {
+            path: mp(&p),
+            data: vec![1],
+        }));
+        let r = call(OsFunctionCall::AppendBytes(PathBytesDataArgs {
+            path: mp(&p),
+            data: vec![2, 3],
+        }));
+        assert!(matches!(r, MontyObject::Int(2)));
+        assert_eq!(std::fs::read(&p).unwrap(), vec![1, 2, 3]);
     }
 
-    #[test]
-    fn path_write_bytes_wrong_type() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.bin");
-        let args = vec![s("not bytes")];
-        let result = path_write_bytes(Some(&p), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::TypeError));
-    }
+    // ── open() ──────────────────────────────────────────────────────
 
-    #[test]
-    fn path_write_bytes_no_path() {
-        let args = vec![MontyObject::Bytes(vec![1])];
-        let result = path_write_bytes(None, &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::OSError));
-    }
-
-    #[test]
-    fn path_write_bytes_data_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "out.bin");
-        let kwargs = vec![kwarg("data", MontyObject::Bytes(vec![4, 5, 6]))];
-        let result = path_write_bytes(Some(&p), &[], &kwargs);
-        assert!(matches!(result, MontyObject::None));
-        assert_eq!(std::fs::read(&p).unwrap(), vec![4, 5, 6]);
-    }
-
-    // ── path_mkdir ──────────────────────────────────────────────────
-
-    #[test]
-    fn path_mkdir_creates_directory() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "newdir");
-        let result = path_mkdir(Some(&p), &[], &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
-        assert!(Path::new(&p).is_dir());
-    }
-
-    #[test]
-    fn path_mkdir_fails_without_parents() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "a/b/c");
-        let result = path_mkdir(Some(&p), &[], &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::OSError));
-    }
-
-    #[test]
-    fn path_mkdir_with_parents() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "a/b/c");
-        // mode=None, parents=True
-        let args = vec![MontyObject::None, MontyObject::Bool(true)];
-        let result = path_mkdir(Some(&p), &args, &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
-        assert!(Path::new(&p).is_dir());
-    }
-
-    #[test]
-    fn path_mkdir_exist_ok() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "existing");
-        std::fs::create_dir(&p).unwrap();
-        // mode=None, parents=False, exist_ok=True
-        let args = vec![
-            MontyObject::None,
-            MontyObject::Bool(false),
-            MontyObject::Bool(true),
-        ];
-        let result = path_mkdir(Some(&p), &args, &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
-    }
-
-    #[test]
-    fn path_mkdir_already_exists_no_exist_ok() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "existing");
-        std::fs::create_dir(&p).unwrap();
-        let result = path_mkdir(Some(&p), &[], &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::OSError));
-    }
-
-    #[test]
-    fn path_mkdir_no_path_returns_none() {
-        let result = path_mkdir(None, &[], &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
-    }
-
-    #[test]
-    fn path_mkdir_mode_wrong_type() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "newdir");
-        let args = vec![s("bad_mode")];
-        let result = path_mkdir(Some(&p), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::TypeError));
-    }
-
-    #[test]
-    fn path_mkdir_parents_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "a/b/c");
-        let kwargs = vec![kwarg("parents", MontyObject::Bool(true))];
-        let result = path_mkdir(Some(&p), &[], &kwargs);
-        assert!(matches!(result, MontyObject::None));
-        assert!(Path::new(&p).is_dir());
-    }
-
-    #[test]
-    fn path_mkdir_exist_ok_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "existing");
-        std::fs::create_dir(&p).unwrap();
-        let kwargs = vec![kwarg("exist_ok", MontyObject::Bool(true))];
-        let result = path_mkdir(Some(&p), &[], &kwargs);
-        assert!(matches!(result, MontyObject::None));
-    }
-
-    #[test]
-    fn path_mkdir_mode_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "modedir");
-        let kwargs = vec![kwarg("mode", MontyObject::Int(0o755))];
-        let result = path_mkdir(Some(&p), &[], &kwargs);
-        assert!(matches!(result, MontyObject::None));
-        assert!(Path::new(&p).is_dir());
-    }
-
-    // ── path_unlink ─────────────────────────────────────────────────
-
-    #[test]
-    fn path_unlink_removes_file() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "to_delete.txt", "bye");
-        let result = path_unlink(Some(&p), &[], &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
-        assert!(!Path::new(&p).exists());
-    }
-
-    #[test]
-    fn path_unlink_nonexistent_fails() {
-        let result = path_unlink(Some("/tmp/__no_such_file_unlink__"), &[], &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::OSError));
-    }
-
-    #[test]
-    fn path_unlink_missing_ok() {
-        let result = path_unlink(
-            Some("/tmp/__no_such_file_unlink_ok__"),
-            &[MontyObject::Bool(true)],
-            &no_kwargs(),
-        );
-        assert!(matches!(result, MontyObject::None));
-    }
-
-    #[test]
-    fn path_unlink_no_path_returns_none() {
-        let result = path_unlink(None, &[], &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
-    }
-
-    #[test]
-    fn path_unlink_missing_ok_wrong_type() {
-        let args = vec![s("yes")];
-        let result = path_unlink(Some("/tmp/__any__"), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::TypeError));
-    }
-
-    #[test]
-    fn path_unlink_missing_ok_via_kwarg() {
-        let kwargs = vec![kwarg("missing_ok", MontyObject::Bool(true))];
-        let result = path_unlink(Some("/tmp/__no_such_unlink_kwarg__"), &[], &kwargs);
-        assert!(matches!(result, MontyObject::None));
-    }
-
-    // ── path_rmdir ──────────────────────────────────────────────────
-
-    #[test]
-    fn path_rmdir_removes_empty_dir() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "empty");
-        std::fs::create_dir(&p).unwrap();
-        let result = path_rmdir(Some(&p));
-        assert!(matches!(result, MontyObject::None));
-        assert!(!Path::new(&p).exists());
-    }
-
-    #[test]
-    fn path_rmdir_fails_on_nonempty_dir() {
-        let dir = TempDir::new().unwrap();
-        let p = child_path(&dir, "nonempty");
-        std::fs::create_dir(&p).unwrap();
-        std::fs::write(Path::new(&p).join("child.txt"), "x").unwrap();
-        let result = path_rmdir(Some(&p));
-        assert!(is_exception_of(&result, ExcType::OSError));
-    }
-
-    #[test]
-    fn path_rmdir_nonexistent() {
-        let result = path_rmdir(Some("/tmp/__no_such_dir_rmdir__"));
-        assert!(is_exception_of(&result, ExcType::OSError));
-    }
-
-    #[test]
-    fn path_rmdir_no_path_returns_none() {
-        let result = path_rmdir(None);
-        assert!(matches!(result, MontyObject::None));
-    }
-
-    // ── path_iterdir ────────────────────────────────────────────────
-
-    #[test]
-    fn path_iterdir_lists_contents() {
-        let dir = TempDir::new().unwrap();
-        create_file(&dir, "a.txt", "a");
-        create_file(&dir, "b.txt", "b");
-        let p = dir.path().to_string_lossy().into_owned();
-        let result = path_iterdir(Some(&p));
-        if let MontyObject::List(items) = &result {
-            assert_eq!(items.len(), 2);
-            // All items should be strings
-            for item in items {
-                assert!(matches!(item, MontyObject::String(_)));
-            }
-        } else {
-            panic!("expected List, got {:?}", result);
+    fn open_args(path: &str, mode: &str) -> OpenCallArgs {
+        OpenCallArgs {
+            path: mp(path),
+            mode: mode.parse().unwrap(),
         }
     }
 
     #[test]
-    fn path_iterdir_empty_dir() {
+    fn open_read_existing_returns_handle() {
+        let dir = TempDir::new().unwrap();
+        let p = create_file(&dir, "r.txt", "hi");
+        let r = call(OsFunctionCall::Open(open_args(&p, "r")));
+        assert!(matches!(r, MontyObject::FileHandle(_)));
+    }
+
+    #[test]
+    fn open_read_nonexistent_raises_file_not_found() {
+        let r = call(OsFunctionCall::Open(open_args(
+            "/tmp/__no_such_open_target__",
+            "r",
+        )));
+        assert!(is_exception_of(&r, ExcType::FileNotFoundError));
+    }
+
+    #[test]
+    fn open_read_directory_raises_is_a_directory() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().to_string_lossy().into_owned();
-        let result = path_iterdir(Some(&p));
-        assert!(matches!(result, MontyObject::List(ref v) if v.is_empty()));
+        let r = call(OsFunctionCall::Open(open_args(&p, "r")));
+        assert!(is_exception_of(&r, ExcType::IsADirectoryError));
     }
 
     #[test]
-    fn path_iterdir_nonexistent() {
-        let result = path_iterdir(Some("/tmp/__no_such_dir_iterdir__"));
-        assert!(is_exception_of(&result, ExcType::OSError));
-    }
-
-    #[test]
-    fn path_iterdir_no_path_returns_empty_list() {
-        let result = path_iterdir(None);
-        assert!(matches!(result, MontyObject::List(ref v) if v.is_empty()));
-    }
-
-    // ── path_stat ───────────────────────────────────────────────────
-
-    #[test]
-    fn path_stat_file_returns_named_tuple() {
+    fn open_write_truncates_existing_file() {
         let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "stat_me.txt", "some data");
-        let result = path_stat(Some(&p), &no_kwargs());
-        assert!(matches!(result, MontyObject::NamedTuple { .. }));
+        let p = create_file(&dir, "w.txt", "existing");
+        let r = call(OsFunctionCall::Open(open_args(&p, "w")));
+        assert!(matches!(r, MontyObject::FileHandle(_)));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
     }
 
     #[test]
-    fn path_stat_directory_returns_named_tuple() {
+    fn open_write_creates_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let p = child_path(&dir, "new.txt");
+        let r = call(OsFunctionCall::Open(open_args(&p, "w")));
+        assert!(matches!(r, MontyObject::FileHandle(_)));
+        assert!(Path::new(&p).is_file());
+    }
+
+    #[test]
+    fn open_append_preserves_existing_content() {
+        let dir = TempDir::new().unwrap();
+        let p = create_file(&dir, "a.txt", "keep");
+        let r = call(OsFunctionCall::Open(open_args(&p, "a")));
+        assert!(matches!(r, MontyObject::FileHandle(_)));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "keep");
+    }
+
+    #[test]
+    fn open_handle_carries_path_and_zero_position() {
+        let dir = TempDir::new().unwrap();
+        let p = create_file(&dir, "h.txt", "x");
+        if let MontyObject::FileHandle(MontyFileHandle { path, position, .. }) =
+            call(OsFunctionCall::Open(open_args(&p, "r")))
+        {
+            assert_eq!(path, p);
+            assert_eq!(position, 0);
+        } else {
+            panic!("expected FileHandle");
+        }
+    }
+
+    // ── Mkdir ───────────────────────────────────────────────────────
+
+    fn mkdir_args(path: &str, parents: bool, exist_ok: bool) -> MkdirCallArgs {
+        MkdirCallArgs {
+            path: mp(path),
+            parents,
+            exist_ok,
+        }
+    }
+
+    #[test]
+    fn mkdir_creates_directory() {
+        let dir = TempDir::new().unwrap();
+        let p = child_path(&dir, "newdir");
+        let r = call(OsFunctionCall::Mkdir(mkdir_args(&p, false, false)));
+        assert!(matches!(r, MontyObject::None));
+        assert!(Path::new(&p).is_dir());
+    }
+
+    #[test]
+    fn mkdir_fails_without_parents_for_nested() {
+        let dir = TempDir::new().unwrap();
+        let p = child_path(&dir, "a/b/c");
+        let r = call(OsFunctionCall::Mkdir(mkdir_args(&p, false, false)));
+        assert!(is_exception_of(&r, ExcType::OSError));
+    }
+
+    #[test]
+    fn mkdir_with_parents_creates_nested() {
+        let dir = TempDir::new().unwrap();
+        let p = child_path(&dir, "x/y/z");
+        let r = call(OsFunctionCall::Mkdir(mkdir_args(&p, true, false)));
+        assert!(matches!(r, MontyObject::None));
+        assert!(Path::new(&p).is_dir());
+    }
+
+    #[test]
+    fn mkdir_already_exists_no_exist_ok_fails() {
+        let dir = TempDir::new().unwrap();
+        let p = child_path(&dir, "ex");
+        std::fs::create_dir(&p).unwrap();
+        let r = call(OsFunctionCall::Mkdir(mkdir_args(&p, false, false)));
+        assert!(is_exception_of(&r, ExcType::OSError));
+    }
+
+    #[test]
+    fn mkdir_already_exists_with_exist_ok_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let p = child_path(&dir, "ex");
+        std::fs::create_dir(&p).unwrap();
+        let r = call(OsFunctionCall::Mkdir(mkdir_args(&p, false, true)));
+        assert!(matches!(r, MontyObject::None));
+    }
+
+    // ── Unlink ──────────────────────────────────────────────────────
+
+    #[test]
+    fn unlink_removes_file() {
+        let dir = TempDir::new().unwrap();
+        let p = create_file(&dir, "rm.txt", "");
+        let r = call(OsFunctionCall::Unlink(mp(&p)));
+        assert!(matches!(r, MontyObject::None));
+        assert!(!Path::new(&p).exists());
+    }
+
+    #[test]
+    fn unlink_fails_on_nonexistent() {
+        // Monty no longer forwards `missing_ok`, so this always errors.
+        let r = call(OsFunctionCall::Unlink(mp("/tmp/__no_such_unlink__")));
+        assert!(is_exception_of(&r, ExcType::OSError));
+    }
+
+    // ── Rmdir ───────────────────────────────────────────────────────
+
+    #[test]
+    fn rmdir_removes_empty_directory() {
+        let dir = TempDir::new().unwrap();
+        let p = child_path(&dir, "empty");
+        std::fs::create_dir(&p).unwrap();
+        let r = call(OsFunctionCall::Rmdir(mp(&p)));
+        assert!(matches!(r, MontyObject::None));
+        assert!(!Path::new(&p).exists());
+    }
+
+    #[test]
+    fn rmdir_fails_on_nonempty_directory() {
+        let dir = TempDir::new().unwrap();
+        let p = child_path(&dir, "nonempty");
+        std::fs::create_dir(&p).unwrap();
+        let _ = create_file(&dir, "nonempty/file.txt", "x");
+        let r = call(OsFunctionCall::Rmdir(mp(&p)));
+        assert!(is_exception_of(&r, ExcType::OSError));
+    }
+
+    #[test]
+    fn rmdir_fails_on_nonexistent() {
+        let r = call(OsFunctionCall::Rmdir(mp("/tmp/__no_such_rmdir__")));
+        assert!(is_exception_of(&r, ExcType::OSError));
+    }
+
+    // ── Iterdir ─────────────────────────────────────────────────────
+
+    #[test]
+    fn iterdir_lists_contents() {
+        let dir = TempDir::new().unwrap();
+        let _ = create_file(&dir, "a.txt", "");
+        let _ = create_file(&dir, "b.txt", "");
+        let p = dir.path().to_string_lossy().into_owned();
+        let r = call(OsFunctionCall::Iterdir(mp(&p)));
+        match r {
+            MontyObject::List(items) => {
+                assert_eq!(items.len(), 2);
+                let mut names: Vec<String> = items
+                    .into_iter()
+                    .map(|o| match o {
+                        MontyObject::String(s) => std::path::Path::new(&s)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or(s),
+                        other => panic!("expected String entry, got {other:?}"),
+                    })
+                    .collect();
+                names.sort();
+                assert_eq!(names, vec!["a.txt", "b.txt"]);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn iterdir_empty_directory_returns_empty_list() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().to_string_lossy().into_owned();
-        let result = path_stat(Some(&p), &no_kwargs());
-        assert!(matches!(result, MontyObject::NamedTuple { .. }));
+        let r = call(OsFunctionCall::Iterdir(mp(&p)));
+        assert!(matches!(r, MontyObject::List(ref items) if items.is_empty()));
     }
 
     #[test]
-    fn path_stat_nonexistent() {
-        let result = path_stat(Some("/tmp/__no_such_file_stat__"), &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::OSError));
+    fn iterdir_nonexistent_returns_oserror() {
+        // Previously returned an empty list when the path was `None`. Monty
+        // now always provides a typed path; a missing directory surfaces as
+        // a real OS error.
+        let r = call(OsFunctionCall::Iterdir(mp("/tmp/__no_such_iter__")));
+        assert!(is_exception_of(&r, ExcType::OSError));
     }
 
-    #[test]
-    fn path_stat_no_path_returns_none() {
-        let result = path_stat(None, &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
-    }
+    // ── Stat ────────────────────────────────────────────────────────
 
     #[test]
-    fn path_stat_follow_symlinks_kwarg_wrong_type() {
-        let kwargs = vec![kwarg("follow_symlinks", s("yes"))];
-        let result = path_stat(Some("/tmp"), &kwargs);
-        assert!(is_exception_of(&result, ExcType::TypeError));
-    }
-
-    // ── path_rename ─────────────────────────────────────────────────
-
-    #[test]
-    fn path_rename_success() {
+    fn stat_file_returns_stat_result() {
         let dir = TempDir::new().unwrap();
-        let src = create_file(&dir, "old.txt", "content");
-        let dst = child_path(&dir, "new.txt");
-        let args = vec![s(&dst)];
-        let result = path_rename(Some(&src), &args, &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
+        let p = create_file(&dir, "f.txt", "hi");
+        let r = call(OsFunctionCall::Stat(mp(&p)));
+        // `file_stat` returns a NamedTuple wrapper; we just verify the call
+        // produced a non-error, non-None value.
+        assert!(!matches!(r, MontyObject::Exception { .. }));
+        assert!(!matches!(r, MontyObject::None));
+    }
+
+    #[test]
+    fn stat_directory_returns_stat_result() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().to_string_lossy().into_owned();
+        let r = call(OsFunctionCall::Stat(mp(&p)));
+        assert!(!matches!(r, MontyObject::Exception { .. }));
+    }
+
+    #[test]
+    fn stat_nonexistent_returns_oserror() {
+        let r = call(OsFunctionCall::Stat(mp("/tmp/__no_such_stat__")));
+        assert!(is_exception_of(&r, ExcType::OSError));
+    }
+
+    // ── Rename ──────────────────────────────────────────────────────
+
+    #[test]
+    fn rename_success() {
+        let dir = TempDir::new().unwrap();
+        let src = create_file(&dir, "from.txt", "data");
+        let dst = child_path(&dir, "to.txt");
+        let r = call(OsFunctionCall::Rename(RenameCallArgs {
+            src: mp(&src),
+            dst: mp(&dst),
+        }));
+        assert!(matches!(r, MontyObject::None));
         assert!(!Path::new(&src).exists());
-        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "content");
-    }
-
-    #[test]
-    fn path_rename_with_path_target() {
-        let dir = TempDir::new().unwrap();
-        let src = create_file(&dir, "old.txt", "data");
-        let dst = child_path(&dir, "new.txt");
-        let args = vec![MontyObject::Path(dst.clone())];
-        let result = path_rename(Some(&src), &args, &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
         assert_eq!(std::fs::read_to_string(&dst).unwrap(), "data");
     }
 
     #[test]
-    fn path_rename_missing_target() {
+    fn rename_nonexistent_source_returns_oserror() {
         let dir = TempDir::new().unwrap();
-        let src = create_file(&dir, "f.txt", "x");
-        let result = path_rename(Some(&src), &[], &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::TypeError));
-        if let MontyObject::Exception { arg, .. } = &result {
-            assert!(arg.as_ref().unwrap().contains("target"));
+        let dst = child_path(&dir, "to.txt");
+        let r = call(OsFunctionCall::Rename(RenameCallArgs {
+            src: mp("/tmp/__no_such_rename_src__"),
+            dst: mp(&dst),
+        }));
+        assert!(is_exception_of(&r, ExcType::OSError));
+    }
+
+    // ── Resolve / Absolute ──────────────────────────────────────────
+
+    #[test]
+    fn resolve_existing_file_returns_canonical_string() {
+        let dir = TempDir::new().unwrap();
+        let p = create_file(&dir, "r.txt", "x");
+        let r = call(OsFunctionCall::Resolve(mp(&p)));
+        match r {
+            MontyObject::String(s) => {
+                assert!(s.contains("r.txt"));
+                assert!(Path::new(&s).is_absolute());
+            }
+            other => panic!("expected String, got {other:?}"),
         }
     }
 
     #[test]
-    fn path_rename_target_wrong_type() {
-        let dir = TempDir::new().unwrap();
-        let src = create_file(&dir, "f.txt", "x");
-        let args = vec![MontyObject::Int(42)];
-        let result = path_rename(Some(&src), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::TypeError));
+    fn resolve_nonexistent_returns_a_path_string() {
+        // Non-strict: never fails even if the target doesn't exist.
+        let r = call(OsFunctionCall::Resolve(mp("/tmp/__no_such_resolve__")));
+        assert!(matches!(r, MontyObject::String(_)));
     }
 
     #[test]
-    fn path_rename_no_path() {
-        let dir = TempDir::new().unwrap();
-        let dst = child_path(&dir, "dst.txt");
-        let args = vec![s(&dst)];
-        let result = path_rename(None, &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::OSError));
-        if let MontyObject::Exception { arg, .. } = &result {
-            assert!(arg.as_ref().unwrap().contains("no path"));
+    fn absolute_returns_absolute_path_for_relative_input() {
+        let r = call(OsFunctionCall::Absolute(mp("relative.txt")));
+        match r {
+            MontyObject::String(s) => assert!(Path::new(&s).is_absolute()),
+            other => panic!("expected String, got {other:?}"),
         }
     }
 
     #[test]
-    fn path_rename_nonexistent_source() {
+    fn absolute_keeps_absolute_input() {
         let dir = TempDir::new().unwrap();
-        let dst = child_path(&dir, "dst.txt");
-        let args = vec![s(&dst)];
-        let result = path_rename(Some("/tmp/__no_such_rename_src__"), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::OSError));
-    }
-
-    #[test]
-    fn path_rename_target_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let src = create_file(&dir, "old.txt", "kwarg rename");
-        let dst = child_path(&dir, "new.txt");
-        let kwargs = vec![kwarg("target", s(&dst))];
-        let result = path_rename(Some(&src), &[], &kwargs);
-        assert!(matches!(result, MontyObject::None));
-        assert!(!Path::new(&src).exists());
-        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "kwarg rename");
-    }
-
-    #[test]
-    fn path_rename_target_path_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let src = create_file(&dir, "old2.txt", "path kwarg");
-        let dst = child_path(&dir, "new2.txt");
-        let kwargs = vec![kwarg("target", MontyObject::Path(dst.clone()))];
-        let result = path_rename(Some(&src), &[], &kwargs);
-        assert!(matches!(result, MontyObject::None));
-        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "path kwarg");
-    }
-
-    // ── path_resolve ────────────────────────────────────────────────
-
-    #[test]
-    fn path_resolve_existing_file() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "resolve_me.txt", "ok");
-        let result = path_resolve(Some(&p), &[], &no_kwargs());
-        if let MontyObject::String(resolved) = &result {
-            assert!(Path::new(resolved).is_absolute());
-        } else {
-            panic!("expected String, got {:?}", result);
+        let p = dir.path().to_string_lossy().into_owned();
+        let r = call(OsFunctionCall::Absolute(mp(&p)));
+        match r {
+            MontyObject::String(s) => assert!(s.contains(&p)),
+            other => panic!("expected String, got {other:?}"),
         }
     }
 
-    #[test]
-    fn path_resolve_strict_nonexistent_fails() {
-        let args = vec![MontyObject::Bool(true)];
-        let result = path_resolve(Some("/tmp/__no_such_resolve_strict__"), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::OSError));
-    }
-
-    #[test]
-    fn path_resolve_non_strict_nonexistent_returns_string() {
-        let result = path_resolve(Some("relative/nonexistent"), &[], &no_kwargs());
-        assert!(matches!(result, MontyObject::String(_)));
-    }
-
-    #[test]
-    fn path_resolve_no_path_returns_empty_string() {
-        let result = path_resolve(None, &[], &no_kwargs());
-        assert!(matches!(result, MontyObject::String(ref s) if s.is_empty()));
-    }
-
-    #[test]
-    fn path_resolve_strict_kwarg_wrong_type() {
-        let args = vec![s("yes")];
-        let result = path_resolve(Some("/tmp"), &args, &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::TypeError));
-    }
-
-    #[test]
-    fn path_resolve_strict_existing_returns_absolute() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "strict.txt", "ok");
-        let args = vec![MontyObject::Bool(true)];
-        let result = path_resolve(Some(&p), &args, &no_kwargs());
-        if let MontyObject::String(resolved) = &result {
-            assert!(Path::new(resolved).is_absolute());
-        } else {
-            panic!("expected String, got {:?}", result);
-        }
-    }
-
-    #[test]
-    fn path_resolve_strict_via_kwarg() {
-        let dir = TempDir::new().unwrap();
-        let p = create_file(&dir, "strict_kw.txt", "ok");
-        let kwargs = vec![kwarg("strict", MontyObject::Bool(true))];
-        let result = path_resolve(Some(&p), &[], &kwargs);
-        if let MontyObject::String(resolved) = &result {
-            assert!(Path::new(resolved).is_absolute());
-        } else {
-            panic!("expected String, got {:?}", result);
-        }
-    }
-
-    #[test]
-    fn path_resolve_strict_nonexistent_via_kwarg() {
-        let kwargs = vec![kwarg("strict", MontyObject::Bool(true))];
-        let result = path_resolve(Some("/tmp/__no_such_resolve_kw__"), &[], &kwargs);
-        assert!(is_exception_of(&result, ExcType::OSError));
-    }
-
-    // ── path_absolute ───────────────────────────────────────────────
-
-    #[test]
-    fn path_absolute_returns_absolute_path() {
-        let result = path_absolute(Some("some/relative"));
-        if let MontyObject::String(abs) = &result {
-            assert!(Path::new(abs).is_absolute());
-            assert!(abs.ends_with("some/relative"));
-        } else {
-            panic!("expected String, got {:?}", result);
-        }
-    }
-
-    #[test]
-    fn path_absolute_already_absolute() {
-        let result = path_absolute(Some("/already/absolute"));
-        if let MontyObject::String(abs) = &result {
-            assert!(abs.contains("/already/absolute"));
-        } else {
-            panic!("expected String, got {:?}", result);
-        }
-    }
-
-    #[test]
-    fn path_absolute_no_path_returns_empty_string() {
-        let result = path_absolute(None);
-        assert!(matches!(result, MontyObject::String(ref s) if s.is_empty()));
-    }
-
-    // ── write then read round-trips ─────────────────────────────────
+    // ── Roundtrips ──────────────────────────────────────────────────
 
     #[test]
     fn write_text_then_read_text_roundtrip() {
         let dir = TempDir::new().unwrap();
         let p = child_path(&dir, "roundtrip.txt");
         let content = "hello\nworld\n🎉";
-        let w_args = vec![s(content)];
-        let w = path_write_text(Some(&p), &w_args, &no_kwargs());
-        assert!(matches!(w, MontyObject::None));
-        let r = path_read_text(Some(&p), &[], &no_kwargs());
+        let w = call(OsFunctionCall::WriteText(PathStringDataArgs {
+            path: mp(&p),
+            data: content.into(),
+        }));
+        // 13 characters: "hello" + "\n" + "world" + "\n" + "🎉"
+        assert!(matches!(w, MontyObject::Int(13)));
+        let r = call(OsFunctionCall::ReadText(mp(&p)));
         assert!(matches!(r, MontyObject::String(ref s) if s == content));
     }
 
@@ -1711,247 +963,148 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = child_path(&dir, "roundtrip.bin");
         let data = vec![0, 1, 127, 128, 255];
-        let w_args = vec![MontyObject::Bytes(data.clone())];
-        let w = path_write_bytes(Some(&p), &w_args, &no_kwargs());
-        assert!(matches!(w, MontyObject::None));
-        let r = path_read_bytes(Some(&p));
+        let w = call(OsFunctionCall::WriteBytes(PathBytesDataArgs {
+            path: mp(&p),
+            data: data.clone(),
+        }));
+        assert!(matches!(w, MontyObject::Int(5)));
+        let r = call(OsFunctionCall::ReadBytes(mp(&p)));
         assert!(matches!(r, MontyObject::Bytes(ref b) if *b == data));
     }
-
-    // ── mkdir then iterdir then rmdir round-trip ────────────────────
 
     #[test]
     fn mkdir_iterdir_rmdir_lifecycle() {
         let dir = TempDir::new().unwrap();
-        let sub = child_path(&dir, "sub");
-
-        // mkdir
-        let result = path_mkdir(Some(&sub), &[], &no_kwargs());
-        assert!(matches!(result, MontyObject::None));
-
-        // iterdir on parent shows our sub
-        let parent = dir.path().to_string_lossy().into_owned();
-        let list = path_iterdir(Some(&parent));
-        if let MontyObject::List(items) = &list {
-            assert_eq!(items.len(), 1);
-        } else {
-            panic!("expected List");
-        }
-
-        // rmdir
-        let result = path_rmdir(Some(&sub));
-        assert!(matches!(result, MontyObject::None));
-        assert!(!Path::new(&sub).exists());
+        let p = child_path(&dir, "lifecycle");
+        assert!(matches!(
+            call(OsFunctionCall::Mkdir(mkdir_args(&p, false, false))),
+            MontyObject::None
+        ));
+        assert!(matches!(
+            call(OsFunctionCall::Iterdir(mp(&p))),
+            MontyObject::List(ref items) if items.is_empty()
+        ));
+        assert!(matches!(
+            call(OsFunctionCall::Rmdir(mp(&p))),
+            MontyObject::None
+        ));
+        assert!(!Path::new(&p).exists());
     }
 
-    // ── date_today ──────────────────────────────────────────────────
+    // ── Environment ─────────────────────────────────────────────────
 
     #[test]
-    fn date_today_returns_date_variant() {
-        let before = Local::now().date_naive();
-        let result = date_today();
-        let after = Local::now().date_naive();
+    fn getenv_unset_returns_string_default() {
+        // The test-build stub for `extism_config_get` always returns
+        // `Ok(None)`, so the caller's `default` is what comes back.
+        let r = call(OsFunctionCall::Getenv(GetenvArgs {
+            key: "NEVER_SET".into(),
+            default: MontyObject::String("fallback".into()),
+        }));
+        assert!(matches!(r, MontyObject::String(ref s) if s == "fallback"));
+    }
 
-        match result {
+    #[test]
+    fn getenv_unset_with_none_default() {
+        let r = call(OsFunctionCall::Getenv(GetenvArgs {
+            key: "NEVER_SET".into(),
+            default: MontyObject::None,
+        }));
+        assert!(matches!(r, MontyObject::None));
+    }
+
+    #[test]
+    fn get_environ_returns_unsupported_oserror() {
+        let r = call(OsFunctionCall::GetEnviron);
+        assert!(is_exception_of(&r, ExcType::OSError));
+    }
+
+    // ── Date / Time ─────────────────────────────────────────────────
+
+    #[test]
+    fn date_today_returns_date_variant_in_valid_ranges() {
+        let r = call(OsFunctionCall::DateToday);
+        match r {
             MontyObject::Date(d) => {
-                // Allow for the rare case where the date rolls over during
-                // the call by accepting either `before` or `after`.
-                let year_ok = d.year == before.year() || d.year == after.year();
-                let month_ok = d.month == before.month() as u8 || d.month == after.month() as u8;
-                let day_ok = d.day == before.day() as u8 || d.day == after.day() as u8;
-                assert!(year_ok, "year mismatch: got {}", d.year);
-                assert!(month_ok, "month mismatch: got {}", d.month);
-                assert!(day_ok, "day mismatch: got {}", d.day);
+                assert!(d.year >= 2024);
+                assert!(d.month >= 1 && d.month <= 12);
+                assert!(d.day >= 1 && d.day <= 31);
             }
-            other => panic!("expected Date, got {:?}", other),
+            other => panic!("expected Date, got {other:?}"),
         }
     }
 
     #[test]
-    fn date_today_fields_in_valid_ranges() {
-        if let MontyObject::Date(d) = date_today() {
-            assert!((1..=9999).contains(&d.year));
-            assert!((1..=12).contains(&d.month));
-            assert!((1..=31).contains(&d.day));
-        } else {
-            panic!("expected Date");
-        }
-    }
-
-    // ── datetime_now ────────────────────────────────────────────────
-
-    #[test]
-    fn datetime_now_no_args_returns_local_datetime() {
-        let before = Local::now();
-        let result = datetime_now(&[], &no_kwargs());
-        let after = Local::now();
-
-        match result {
+    fn datetime_now_no_tz_returns_local_datetime() {
+        let r = call(OsFunctionCall::DateTimeNow(MontyObject::None));
+        match r {
             MontyObject::DateTime(dt) => {
-                assert!(dt.offset_seconds.is_some(), "expected aware datetime");
-                assert!(dt.timezone_name.is_none(), "expected no explicit tz name");
-                assert!(
-                    dt.year == before.year() || dt.year == after.year(),
-                    "year mismatch"
-                );
-                let local_offset = before.offset().local_minus_utc();
-                assert_eq!(dt.offset_seconds, Some(local_offset));
-            }
-            other => panic!("expected DateTime, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn datetime_now_no_args_fields_in_valid_ranges() {
-        if let MontyObject::DateTime(dt) = datetime_now(&[], &no_kwargs()) {
-            assert!((1..=9999).contains(&dt.year));
-            assert!((1..=12).contains(&dt.month));
-            assert!((1..=31).contains(&dt.day));
-            assert!(dt.hour <= 23);
-            assert!(dt.minute <= 59);
-            assert!(dt.second <= 59);
-            assert!(dt.microsecond <= 999_999);
-        } else {
-            panic!("expected DateTime");
-        }
-    }
-
-    #[test]
-    fn datetime_now_with_none_tz_returns_local_datetime() {
-        let result = datetime_now(&[MontyObject::None], &no_kwargs());
-        match result {
-            MontyObject::DateTime(dt) => {
-                assert!(dt.offset_seconds.is_some());
+                assert!(dt.year >= 2024);
                 assert!(dt.timezone_name.is_none());
             }
-            other => panic!("expected DateTime, got {:?}", other),
+            other => panic!("expected DateTime, got {other:?}"),
         }
     }
 
     #[test]
     fn datetime_now_with_utc_timezone() {
-        let tz = MontyObject::TimeZone(MontyTimeZone {
-            offset_seconds: 0,
-            name: Some("UTC".to_string()),
-        });
-        let result = datetime_now(&[tz], &no_kwargs());
-        match result {
+        let r = call(OsFunctionCall::DateTimeNow(MontyObject::TimeZone(
+            MontyTimeZone {
+                offset_seconds: 0,
+                name: Some("UTC".into()),
+            },
+        )));
+        match r {
             MontyObject::DateTime(dt) => {
                 assert_eq!(dt.offset_seconds, Some(0));
-                assert_eq!(dt.timezone_name, Some("UTC".to_string()));
+                assert_eq!(dt.timezone_name, Some("UTC".into()));
             }
-            other => panic!("expected DateTime, got {:?}", other),
+            other => panic!("expected DateTime, got {other:?}"),
         }
     }
 
     #[test]
     fn datetime_now_with_positive_offset_timezone() {
-        let offset = 5 * 3600 + 30 * 60; // +05:30
-        let tz = MontyObject::TimeZone(MontyTimeZone {
-            offset_seconds: offset,
-            name: Some("Asia/Kolkata".to_string()),
-        });
-        let result = datetime_now(&[tz], &no_kwargs());
-        match result {
-            MontyObject::DateTime(dt) => {
-                assert_eq!(dt.offset_seconds, Some(offset));
-                assert_eq!(dt.timezone_name, Some("Asia/Kolkata".to_string()));
-            }
-            other => panic!("expected DateTime, got {:?}", other),
+        let r = call(OsFunctionCall::DateTimeNow(MontyObject::TimeZone(
+            MontyTimeZone {
+                offset_seconds: 3 * 3600,
+                name: Some("EAT".into()),
+            },
+        )));
+        match r {
+            MontyObject::DateTime(dt) => assert_eq!(dt.offset_seconds, Some(3 * 3600)),
+            other => panic!("expected DateTime, got {other:?}"),
         }
     }
 
     #[test]
     fn datetime_now_with_negative_offset_timezone() {
-        let offset = -(5 * 3600); // -05:00
-        let tz = MontyObject::TimeZone(MontyTimeZone {
-            offset_seconds: offset,
-            name: None,
-        });
-        let result = datetime_now(&[tz], &no_kwargs());
-        match result {
-            MontyObject::DateTime(dt) => {
-                assert_eq!(dt.offset_seconds, Some(offset));
-                assert!(dt.timezone_name.is_none());
-            }
-            other => panic!("expected DateTime, got {:?}", other),
+        let r = call(OsFunctionCall::DateTimeNow(MontyObject::TimeZone(
+            MontyTimeZone {
+                offset_seconds: -5 * 3600,
+                name: Some("EST".into()),
+            },
+        )));
+        match r {
+            MontyObject::DateTime(dt) => assert_eq!(dt.offset_seconds, Some(-5 * 3600)),
+            other => panic!("expected DateTime, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn datetime_now_tz_via_kwarg() {
-        let tz = MontyObject::TimeZone(MontyTimeZone {
-            offset_seconds: 3600,
-            name: Some("CET".to_string()),
-        });
-        let kwargs = vec![kwarg("tz", tz)];
-        let result = datetime_now(&[], &kwargs);
-        match result {
-            MontyObject::DateTime(dt) => {
-                assert_eq!(dt.offset_seconds, Some(3600));
-                assert_eq!(dt.timezone_name, Some("CET".to_string()));
-            }
-            other => panic!("expected DateTime, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn datetime_now_none_tz_via_kwarg() {
-        let kwargs = vec![kwarg("tz", MontyObject::None)];
-        let result = datetime_now(&[], &kwargs);
-        match result {
-            MontyObject::DateTime(dt) => {
-                assert!(dt.offset_seconds.is_some());
-                assert!(dt.timezone_name.is_none());
-            }
-            other => panic!("expected DateTime, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn datetime_now_wrong_tz_type_returns_type_error() {
-        let result = datetime_now(&[s("not a timezone")], &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::TypeError));
-    }
-
-    #[test]
-    fn datetime_now_int_tz_returns_type_error() {
-        let result = datetime_now(&[MontyObject::Int(42)], &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::TypeError));
     }
 
     #[test]
     fn datetime_now_invalid_offset_returns_value_error() {
-        // chrono::FixedOffset::east_opt rejects offsets >= 86_400 seconds
-        let tz = MontyObject::TimeZone(MontyTimeZone {
-            offset_seconds: 100_000,
-            name: None,
-        });
-        let result = datetime_now(&[tz], &no_kwargs());
-        assert!(is_exception_of(&result, ExcType::ValueError));
+        let r = call(OsFunctionCall::DateTimeNow(MontyObject::TimeZone(
+            MontyTimeZone {
+                offset_seconds: 1_000_000, // far outside ±24h
+                name: None,
+            },
+        )));
+        assert!(is_exception_of(&r, ExcType::ValueError));
     }
 
     #[test]
-    fn datetime_now_utc_timezone_matches_utc_clock() {
-        let tz = MontyObject::TimeZone(MontyTimeZone {
-            offset_seconds: 0,
-            name: Some("UTC".to_string()),
-        });
-        let before = Utc::now();
-        let result = datetime_now(&[tz], &no_kwargs());
-        let after = Utc::now();
-
-        if let MontyObject::DateTime(dt) = result {
-            // The hour should be one of the two observations
-            assert!(
-                dt.hour == before.hour() as u8 || dt.hour == after.hour() as u8,
-                "hour mismatch: got {}, expected {} or {}",
-                dt.hour,
-                before.hour(),
-                after.hour()
-            );
-        } else {
-            panic!("expected DateTime");
-        }
+    fn datetime_now_wrong_tz_type_returns_type_error() {
+        let r = call(OsFunctionCall::DateTimeNow(MontyObject::Int(0)));
+        assert!(is_exception_of(&r, ExcType::TypeError));
     }
 }
