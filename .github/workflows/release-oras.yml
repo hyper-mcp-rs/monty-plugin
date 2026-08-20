@@ -35,7 +35,7 @@ jobs:
       - name: Install Rust toolchain + wasm target
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.96"
+          toolchain: "1.98"
           components: rustc rust-std cargo clippy rustfmt
           targets: wasm32-wasip1
 
