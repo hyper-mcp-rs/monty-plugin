@@ -14,7 +14,7 @@ base64-serde = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 extism-pdk = "1.4"
 git-version = "0.3"
-monty = { git = "https://github.com/pydantic/monty", rev = "45a3b2d" }
+monty = { git = "https://github.com/pydantic/monty", rev = "dd5307d15e80a57ba4fceecfe6ea472e6b5f4a85" }
 schemars = "1.2"
 oauth2 = { version = "5.0", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
